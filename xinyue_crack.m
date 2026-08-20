@@ -7,7 +7,8 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
-#import <sys/icache.h>
+// sys_icache_invalidate declaration (header path varies across SDKs)
+extern void sys_icache_invalidate(void *address, size_t length);
 #import <dlfcn.h>
 
 // ============================================================
