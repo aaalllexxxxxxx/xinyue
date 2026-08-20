@@ -1,404 +1,348 @@
-// xinyue_gadget.dylib - Frida Gadget loader with embedded JS script
-// The JS hook script is embedded in __DATA segment, extracted to a temp file at runtime,
-// then frida-gadget.dylib is loaded via dlopen with a generated config pointing to the script.
+// xinyue_crack.dylib - Complete 1:1 port of hook_activation.js v6
+// Uses ObjC runtime + memory patching only, no Substrate/fishhook dependency
 //
-// Build: GitHub Actions downloads frida-gadget.dylib (arm64) and bundles it alongside this dylib.
-// Inject both xinyue_gadget.dylib AND frida-gadget.dylib into the target app.
-// OR: this dylib dlopen's frida-gadget.dylib from the Frameworks directory.
+// JS equivalent mapping:
+//   Interceptor.replace(addr, callback)  -> patch_memory(addr, MOV W0,#1; RET)
+//   Interceptor.attach(addr, {onEnter})   -> class_replaceMethod / MSHookFunction
+//   Memory.patchCode(addr, writeU32)     -> patch_memory(addr, data)
+//   ObjC Interceptor.replace(IMP,...)    -> class_replaceMethod(IMP)
+//   ObjC Interceptor.attach(IMP,{onEnter})-> method_exchangeImplementations / custom trampoline
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
 #import <dlfcn.h>
-#import <sys/stat.h>
 
-// ============================================================
-// Embedded Frida JS hook script (v6) - stored in __DATA segment
-// ============================================================
+extern void sys_icache_invalidate(void *address, size_t size);
 
-// The script is split into a char array to avoid compiler string length limits
-// and ensure it's placed in the binary's data segment.
-static const char *kHookScriptParts[] = {
-    // Part 1: Helper functions
-    "// XINYUE Hook Script v6 - Embedded in dylib\n",
-    "var MODULE_NAME = \"xyld\";\n",
-    "\n",
-    "function getBase() {\n",
-    "    var m = Process.findModuleByName(MODULE_NAME);\n",
-    "    if (!m) {\n",
-    "        var found = null;\n",
-    "        Process.enumerateModules().forEach(function(mod) {\n",
-    "            if (mod.name === MODULE_NAME || mod.name === \"xyld\") { found = mod; }\n",
-    "        });\n",
-    "        if (!found) {\n",
-    "            Process.enumerateModules().forEach(function(mod) {\n",
-    "                if (mod.path && mod.path.indexOf(\"xyld\") !== -1) { found = mod; }\n",
-    "            });\n",
-    "        }\n",
-    "        return found;\n",
-    "    }\n",
-    "    return m;\n",
-    "}\n",
-    "\n",
-    "function findExport(symbolName) {\n",
-    "    var addr = null;\n",
-    "    try { addr = Module.getGlobalExportByName(symbolName); } catch(e) {}\n",
-    "    if (!addr) {\n",
-    "        Process.enumerateModules().forEach(function(mod) {\n",
-    "            if (addr) return;\n",
-    "            try { addr = mod.getExportByName(symbolName); } catch(e) {}\n",
-    "        });\n",
-    "    }\n",
-    "    return addr;\n",
-    "}\n",
-    "\n",
-    "function tryHookByExport(symbolName, label, hookConfig) {\n",
-    "    var addr = findExport(symbolName);\n",
-    "    if (addr) {\n",
-    "        console.log(\"[+] \" + label + \" export @ \" + addr);\n",
-    "        Interceptor.attach(addr, hookConfig);\n",
-    "        return true;\n",
-    "    }\n",
-    "    return false;\n",
-    "}\n",
-    "\n",
-    "function tryHookByOffset(offset, label, hookConfig) {\n",
-    "    var mod = getBase();\n",
-    "    if (!mod) { console.log(\"[!] No base for \" + label); return false; }\n",
-    "    var addr = mod.base.add(offset);\n",
-    "    console.log(\"[+] \" + label + \" hook @ \" + addr + \" (base=\" + mod.base + \" + 0x\" + offset.toString(16) + \")\");\n",
-    "    Interceptor.attach(addr, hookConfig);\n",
-    "    return true;\n",
-    "}\n",
-    "\n",
-    "function tryReplaceByExport(symbolName, label, retval) {\n",
-    "    var addr = findExport(symbolName);\n",
-    "    if (addr) {\n",
-    "        console.log(\"[+] \" + label + \" REPLACED @ \" + addr + \" -> returns \" + retval);\n",
-    "        Interceptor.replace(addr, new NativeCallback(function() {\n",
-    "            console.log(\"[*] \" + label + \" called -> returning \" + retval);\n",
-    "            return retval;\n",
-    "        }, 'int', []));\n",
-    "        return true;\n",
-    "    }\n",
-    "    return false;\n",
-    "}\n",
-    "\n",
-    "function tryReplaceByOffset(offset, label, retval) {\n",
-    "    var mod = getBase();\n",
-    "    if (!mod) { console.log(\"[!] No base for \" + label); return false; }\n",
-    "    var addr = mod.base.add(offset);\n",
-    "    console.log(\"[+] \" + label + \" REPLACED @ \" + addr + \" -> returns \" + retval);\n",
-    "    Interceptor.replace(addr, new NativeCallback(function() {\n",
-    "        console.log(\"[*] \" + label + \" called -> returning \" + retval);\n",
-    "        return retval;\n",
-    "    }, 'int', []));\n",
-    "    return true;\n",
-    "}\n",
-    "\n",
-    "function trySkipDialogBuilder(offset, label) {\n",
-    "    var mod = getBase();\n",
-    "    if (!mod) { console.log(\"[!] No base for \" + label); return false; }\n",
-    "    var funcAddr = mod.base.add(offset);\n",
-    "    var patchAddr = mod.base.add(offset + 0x08);\n",
-    "    var ldpAddr = mod.base.add(offset + 0x88);\n",
-    "    var branchImm = (ldpAddr.toInt32() - patchAddr.toInt32()) / 4;\n",
-    "    var bInsn = 0x14000000 | (branchImm & 0x03FFFFFF);\n",
-    "    console.log(\"[+] \" + label + \" PATCH @ \" + patchAddr + \" -> B \" + ldpAddr + \" (insn=0x\" + bInsn.toString(16) + \")\");\n",
-    "    Memory.patchCode(patchAddr, 4, function(code) {\n",
-    "        code.writeU32(bInsn);\n",
-    "    });\n",
-    "    console.log(\"[+] \" + label + \" patched: dialog build skipped, tail-call preserved\");\n",
-    "    return true;\n",
-    "}\n",
-    "\n",
-    "console.log(\"\\n=== XINYUE Hook v6 (embedded) ===\\n\");\n",
-    "\n",
-    // Part 2: Hook installations
-    "// 1. REPLACE sub_F14144v\n",
-    "var subReplaced = false;\n",
-    "subReplaced = tryReplaceByExport(\"_Z10sub_F14144v\", \"sub_F14144v\", 1);\n",
-    "if (!subReplaced) { subReplaced = tryReplaceByOffset(0x5cacac, \"sub_F14144v\", 1); }\n",
-    "if (!subReplaced) { console.log(\"[!] sub_F14144v replace FAILED\"); }\n",
-    "\n",
-    "// 2. REPLACE _LFVerifyNetworkActivation\n",
-    "var verifyReplaced = false;\n",
-    "verifyReplaced = tryReplaceByExport(\"_LFVerifyNetworkActivation\", \"LFVerifyNetworkActivation\", 1);\n",
-    "if (!verifyReplaced) { verifyReplaced = tryReplaceByOffset(0x4870, \"LFVerifyNetworkActivation\", 1); }\n",
-    "if (!verifyReplaced) { console.log(\"[!] LFVerifyNetworkActivation replace FAILED\"); }\n",
-    "\n",
-    "// 3. Hook LFVerifierExpiryText\n",
-    "var expiryHooked = false;\n",
-    "if (!expiryHooked) {\n",
-    "    expiryHooked = tryHookByExport(\"_ZL20LFVerifierExpiryTextv\", \"LFVerifierExpiryText\", {\n",
-    "        onEnter: function(args) {},\n",
-    "        onLeave: function(retval) {\n",
-    "            if (retval.isNull()) {\n",
-    "                var fakeStr = ObjC.classes.NSString.stringWithString_(\"2099-12-31 23:59:59\");\n",
-    "                retval.replace(fakeStr);\n",
-    "            }\n",
-    "        }\n",
-    "    });\n",
-    "}\n",
-    "if (!expiryHooked) {\n",
-    "    expiryHooked = tryHookByOffset(0x10f00, \"LFVerifierExpiryText\", {\n",
-    "        onEnter: function(args) {},\n",
-    "        onLeave: function(retval) {\n",
-    "            if (retval.isNull()) {\n",
-    "                var fakeStr = ObjC.classes.NSString.stringWithString_(\"2099-12-31 23:59:59\");\n",
-    "                retval.replace(fakeStr);\n",
-    "            }\n",
-    "        }\n",
-    "    });\n",
-    "}\n",
-    "\n",
-    "// 4. SKIP sub_65D614v dialog builder\n",
-    "var cdkeyDialogSkipped = false;\n",
-    "cdkeyDialogSkipped = trySkipDialogBuilder(0x58be8, \"sub_65D614v (CDKey dialog builder)\");\n",
-    "\n",
-    "// 5. ObjC hooks\n",
-    "if (ObjC.available) {\n",
-    "    var cls = ObjC.classes.ViewController;\n",
-    "    if (cls) {\n",
-    "        console.log(\"[+] ViewController found\");\n",
-    "        if (cls[\"- pollActivationThenReveal\"]) {\n",
-    "            Interceptor.attach(cls[\"- pollActivationThenReveal\"].implementation, {\n",
-    "                onEnter: function(args) { console.log(\"[*] pollActivationThenReveal\"); }\n",
-    "            });\n",
-    "        }\n",
-    "        if (cls[\"- showLaunchScreen\"]) {\n",
-    "            Interceptor.replace(cls[\"- showLaunchScreen\"].implementation, new NativeCallback(function(self, cmd) {\n",
-    "                console.log(\"[*] showLaunchScreen BLOCKED\");\n",
-    "            }, 'void', ['pointer', 'pointer']));\n",
-    "            console.log(\"[+] showLaunchScreen replaced no-op\");\n",
-    "        }\n",
-    "        if (cls[\"- hideLaunchScreen\"]) {\n",
-    "            Interceptor.attach(cls[\"- hideLaunchScreen\"].implementation, {\n",
-    "                onEnter: function(args) { console.log(\"[*] hideLaunchScreen -> passed!\"); }\n",
-    "            });\n",
-    "        }\n",
-    "        if (cls[\"- applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:\"]) {\n",
-    "            Interceptor.attach(cls[\"- applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:\"].implementation, {\n",
-    "                onEnter: function(args) {\n",
-    "                    console.log(\"[*] applyRuntimeState -> authPassed=1\");\n",
-    "                    args[5] = ptr(1);\n",
-    "                }\n",
-    "            });\n",
-    "        }\n",
-    "        if (cls[\"- refreshAuthSummary\"]) {\n",
-    "            Interceptor.attach(cls[\"- refreshAuthSummary\"].implementation, {\n",
-    "                onEnter: function(args) { console.log(\"[*] refreshAuthSummary\"); }\n",
-    "            });\n",
-    "        }\n",
-    "    }\n",
-    "\n",
-    "    // 6. Network monitoring\n",
-    "    var NSURLSession = ObjC.classes.NSURLSession;\n",
-    "    if (NSURLSession && NSURLSession[\"- dataTaskWithRequest:completionHandler:\"]) {\n",
-    "        Interceptor.attach(NSURLSession[\"- dataTaskWithRequest:completionHandler:\"].implementation, {\n",
-    "            onEnter: function(args) {\n",
-    "                var req = new ObjC.Object(args[2]);\n",
-    "                var url = \"\";\n",
-    "                try { url = req.URL() ? req.URL().absoluteString().toString() : \"(null)\"; } catch(e) {}\n",
-    "                var method = \"\";\n",
-    "                try { method = req.HTTPMethod() ? req.HTTPMethod().toString() : \"GET\"; } catch(e) {}\n",
-    "                console.log(\"[NET] \" + method + \" \" + url);\n",
-    "            }\n",
-    "        });\n",
-    "        console.log(\"[+] NSURLSession network hook installed\");\n",
-    "    }\n",
-    "\n",
-    "    // 7. Hook UIAlertController - dismiss ALL alerts\n",
-    "    var uiViewController = ObjC.classes.UIViewController;\n",
-    "    if (uiViewController && uiViewController[\"- presentViewController:animated:completion:\"]) {\n",
-    "        Interceptor.attach(uiViewController[\"- presentViewController:animated:completion:\"].implementation, {\n",
-    "            onEnter: function(args) {\n",
-    "                var presentedVC = new ObjC.Object(args[2]);\n",
-    "                var clsName = presentedVC.$className;\n",
-    "                if (clsName === \"UIAlertController\") {\n",
-    "                    var title = \"\";\n",
-    "                    try { title = presentedVC.title() ? presentedVC.title().toString() : \"\"; } catch(e) {}\n",
-    "                    console.log(\"[*] Presenting UIAlertController: \" + title);\n",
-    "                    if (title && (title.indexOf(\"\\u5fc3\\u60a6\") !== -1 || title.indexOf(\"\\u9a8c\\u8bc1\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u6fc0\\u6d3b\") !== -1 || title.indexOf(\"\\u5361\\u5bc6\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u5931\\u8d25\") !== -1 || title.indexOf(\"\\u4e0d\\u5b58\\u5728\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u8f93\\u5165\") !== -1)) {\n",
-    "                        console.log(\"[*] BLOCKING presentation of: \" + title);\n",
-    "                        args[4] = ptr(NULL);\n",
-    "                    }\n",
-    "                }\n",
-    "            }\n",
-    "        });\n",
-    "        console.log(\"[+] presentViewController hook installed\");\n",
-    "    }\n",
-    "\n",
-    "    if (uiViewController && uiViewController[\"- viewDidAppear:\"]) {\n",
-    "        Interceptor.attach(uiViewController[\"- viewDidAppear:\"].implementation, {\n",
-    "            onEnter: function(args) {\n",
-    "                var self = new ObjC.Object(args[0]);\n",
-    "                var clsName = self.$className;\n",
-    "                if (clsName === \"UIAlertController\") {\n",
-    "                    var title = \"\";\n",
-    "                    try { title = self.title() ? self.title().toString() : \"\"; } catch(e) {}\n",
-    "                    console.log(\"[*] UIAlertController viewDidAppear: \" + title);\n",
-    "                    if (title && (title.indexOf(\"\\u5fc3\\u60a6\") !== -1 || title.indexOf(\"\\u9a8c\\u8bc1\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u6fc0\\u6d3b\") !== -1 || title.indexOf(\"\\u5361\\u5bc6\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u5931\\u8d25\") !== -1 || title.indexOf(\"\\u4e0d\\u5b58\\u5728\") !== -1 ||\n",
-    "                        title.indexOf(\"\\u8f93\\u5165\") !== -1)) {\n",
-    "                        console.log(\"[*] Auto-dismissing: \" + title);\n",
-    "                        var dispatch_async = new NativeFunction(\n",
-    "                            Module.getGlobalExportByName('dispatch_async'),\n",
-    "                            'void', ['pointer', 'pointer']\n",
-    "                        );\n",
-    "                        var dispatch_get_main_queue = new NativeFunction(\n",
-    "                            Module.getGlobalExportByName('dispatch_get_main_queue'),\n",
-    "                            'pointer', []\n",
-    "                        );\n",
-    "                        var block = new ObjC.Block({\n",
-    "                            rettype: 'void',\n",
-    "                            argtypes: [],\n",
-    "                            implementation: function() {\n",
-    "                                self.dismissViewControllerAnimated_completion_(true, NULL);\n",
-    "                            }\n",
-    "                        });\n",
-    "                        dispatch_async(dispatch_get_main_queue(), block);\n",
-    "                    }\n",
-    "                }\n",
-    "            }\n",
-    "        });\n",
-    "        console.log(\"[+] viewDidAppear hook for auto-dismiss\");\n",
-    "    }\n",
-    "\n",
-    "    var alertControllerCls = ObjC.classes.UIAlertController;\n",
-    "    if (alertControllerCls && alertControllerCls[\"- initWithTitle:message:preferredStyle:\"]) {\n",
-    "        Interceptor.attach(alertControllerCls[\"- initWithTitle:message:preferredStyle:\"].implementation, {\n",
-    "            onEnter: function(args) {\n",
-    "                var title = \"\";\n",
-    "                try { title = new ObjC.Object(args[2]).toString(); } catch(e) {}\n",
-    "                var message = \"\";\n",
-    "                try { message = new ObjC.Object(args[3]).toString(); } catch(e) {}\n",
-    "                console.log(\"[ALERT] initWithTitle: \" + title + \" message: \" + message);\n",
-    "            }\n",
-    "        });\n",
-    "        console.log(\"[+] UIAlertController init hook installed\");\n",
-    "    }\n",
-    "}\n",
-    "\n",
-    "console.log(\"\\n=== All hooks v6 installed (embedded) ===\\n\");\n",
-    NULL
-};
+#pragma mark - Memory Patch (Memory.patchCode equivalent)
 
-// Reassemble the script parts into a single string
-static NSString *getEmbeddedScript(void) {
-    NSMutableString *script = [NSMutableString string];
-    for (int i = 0; kHookScriptParts[i] != NULL; i++) {
-        [script appendString:[NSString stringWithUTF8String:kHookScriptParts[i]]];
+static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
+    // ARM64: 16KB pages
+    vm_address_t page = addr & ~0x3FFFULL;
+    vm_size_t pageSize = 0x4000;
+
+    kern_return_t kr = vm_protect(mach_task_self(), page, pageSize,
+                                   FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        // Try 4KB page
+        page = addr & ~0xFFFULL;
+        pageSize = 0x1000;
+        kr = vm_protect(mach_task_self(), page, pageSize,
+                       FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            NSLog(@"[xinyue] vm_protect FAILED at 0x%lx kr=%d", addr, kr);
+            return false;
+        }
     }
-    return [script copy];
+
+    memcpy((void *)addr, data, size);
+
+    // Restore execute-only
+    vm_protect(mach_task_self(), page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate((void *)addr, size);
+
+    // Verify
+    if (memcmp((void *)addr, data, size) != 0) {
+        NSLog(@"[xinyue] patch verify FAILED at 0x%lx", addr);
+        return false;
+    }
+    return true;
 }
 
-// ============================================================
-// Extract embedded script to a temp file and set up Frida Gadget
-// ============================================================
+#pragma mark - Get image base (Process.findModuleByName equivalent)
+
+static uintptr_t get_image_base(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "xyld")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    // Fallback: find MH_EXECUTE
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
+            return (uintptr_t)hdr;
+        }
+    }
+    return 0;
+}
+
+#pragma mark - findExport (Module.getGlobalExportByName equivalent)
+
+static uintptr_t find_export(const char *symbolName) {
+    // Try dlsym with RTLD_DEFAULT
+    void *addr = dlsym(RTLD_DEFAULT, symbolName);
+    if (addr) return (uintptr_t)addr;
+
+    // Try all loaded images
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        if (!hdr) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        // Use dlopen + dlsym on each image
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        void *handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+        if (handle) {
+            addr = dlsym(handle, symbolName);
+            dlclose(handle);
+            if (addr) return (uintptr_t)addr;
+        }
+    }
+    return 0;
+}
+
+#pragma mark - Patch 1 & 2: Interceptor.replace -> return 1
+// ARM64: MOV W0, #1 (0x52800020) ; RET (0xD65F03C0)
+
+static void patch_return_one(uintptr_t addr, const char *label) {
+    uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };  // MOV W0, #1; RET
+    bool ok = patch_memory(addr, insns, sizeof(insns));
+    NSLog(@"[xinyue] [+] %@ REPLACED @ 0x%lx -> returns 1 [%s]", [NSString stringWithUTF8String:label], addr, ok ? "OK" : "FAIL");
+}
+
+#pragma mark - Patch 3: LFVerifierExpiryText hook (onLeave: replace nil with 2099 string)
+// This needs Interceptor.attach with onLeave. We use a different approach:
+// Patch the function to skip the dlsym lookup and use a hardcoded timestamp.
+// LFVerifierExpiryText @ 0x100010f00 (base + 0x10f00)
+// After function prologue (3 instructions = 12 bytes), at offset 0x0c:
+//   Original: ADRP X19, resolved; LDRB W8, [X19,...]; TBZ W8, #0, loc_F28
+//   Patch:    MOVZ X8, #0x5BFF; MOVK X8, #0xF489, LSL#16; B loc_F58 (NSDate path)
+// This makes X8 = 4102444799 (2099-12-31 23:59:59) and jumps to the
+// NSDate dateWithTimeIntervalSince1970: + stringFromDate: path.
+
+static void patch_expiry_text(uintptr_t base) {
+    uintptr_t funcAddr = base + 0x10f00;
+    uintptr_t patchAddr = funcAddr + 0x0c;  // After 3 prologue instructions
+    uintptr_t targetAddr = funcAddr + 0x58; // loc_F58: ADRP X9, classRef_NSDate
+
+    // MOVZ X8, #0x5BFF
+    uint32_t movz = 0xD2800000 | (0x5BFF << 5) | 8;
+    // MOVK X8, #0xF489, LSL #16
+    uint32_t movk = 0xF2A00000 | (0xF489 << 5) | 8;
+    // B targetAddr (relative branch)
+    int32_t imm = (int32_t)(targetAddr - patchAddr - 8) / 4;
+    uint32_t bInsn = 0x14000000 | ((uint32_t)imm & 0x03FFFFFF);
+
+    uint32_t insns[3] = { movz, movk, bInsn };
+    bool ok = patch_memory(patchAddr, insns, sizeof(insns));
+    NSLog(@"[xinyue] [+] LFVerifierExpiryText PATCH @ 0x%lx -> 2099-12-31 23:59:59 [%s]", patchAddr, ok ? "OK" : "FAIL");
+}
+
+#pragma mark - Patch 4: sub_65D614v skip dialog builder (Memory.patchCode)
+// Patch at offset+0x08, B instruction to offset+0x88
+
+static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *label) {
+    uintptr_t patchAddr = base + offset + 0x08;
+    uintptr_t targetAddr = base + offset + 0x88;
+    int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
+    uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFF);
+    bool ok = patch_memory(patchAddr, &bInsn, 4);
+    NSLog(@"[xinyue] [+] %@ PATCH @ 0x%lx -> B 0x%lx (0x%08x) [%s]",
+          [NSString stringWithUTF8String:label], patchAddr, targetAddr, bInsn, ok ? "OK" : "FAIL");
+}
+
+#pragma mark - ObjC hooks (Interceptor.attach onEnter / Interceptor.replace)
+
+// We use IMP replacement via class_replaceMethod + method_getImplementation
+// This is equivalent to Frida's Interceptor.replace(IMP, NativeCallback)
+
+// --- showLaunchScreen: Interceptor.replace -> no-op ---
+static void showLaunchScreen_replacement(id self, SEL _cmd) {
+    // no-op (Frida: console.log("showLaunchScreen BLOCKED"))
+}
+
+// --- applyRuntimeState: Interceptor.attach onEnter -> force authPassed=YES ---
+// We need to call original but with authPassed=1
+// Use a trampoline: save original IMP, replace with our version that calls orig with arg4=YES
+static IMP g_applyRuntimeState_orig = NULL;
+
+static void applyRuntimeState_hook(id self, SEL _cmd, BOOL envReady, BOOL hudRunning, BOOL canExploit, BOOL authPassed) {
+    // Frida: args[5] = ptr(1) -> force authPassed=YES
+    if (g_applyRuntimeState_orig) {
+        ((void(*)(id, SEL, BOOL, BOOL, BOOL, BOOL))g_applyRuntimeState_orig)
+            (self, _cmd, envReady, hudRunning, canExploit, YES);
+    }
+}
+
+// --- presentViewController: Interceptor.attach onEnter -> block CDKey alerts ---
+// We need onEnter with ability to modify args. Use function hook via class_replaceMethod
+// and call original after modifying args.
+static IMP g_presentVC_orig = NULL;
+
+// Helper: check if title contains CDKey-related keywords
+static bool is_cdkey_alert(id presentedVC) {
+    Class cls = object_getClass(presentedVC);
+    if (!cls || strcmp(class_getName(cls), "UIAlertController") != 0) return false;
+
+    // Get title
+    SEL titleSel = sel_registerName("title");
+    IMP titleImp = class_getMethodImplementation(cls, titleSel);
+    if (!titleImp) return false;
+    id titleObj = ((id(*)(id, SEL))titleImp)(presentedVC, titleSel);
+    if (!titleObj) return false;
+
+    const char *title = [((NSString *)titleObj) UTF8String];
+    if (!title) return false;
+
+    // Check keywords: 心悦, 验证, 激活, 卡密, 失败, 不存在, 输入
+    if (strstr(title, "\xe5\xbf\x83\xe6\x82\xa6") || // 心悦
+        strstr(title, "\xe9\xaa\x8c\xe8\xaf\x81") || // 验证
+        strstr(title, "\xe6\xbf\x80\xe6\xb4\xbb") || // 激活
+        strstr(title, "\xe5\x8d\xa1\xe5\xaf\x86") || // 卡密
+        strstr(title, "\xe5\xa4\xb1\xe8\xb4\xa5") || // 失败
+        strstr(title, "\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8") || // 不存在
+        strstr(title, "\xe8\xbe\x93\xe5\x85\xa5")) {   // 输入
+        return true;
+    }
+    return false;
+}
+
+static void presentViewController_hook(id self, SEL _cmd, id presentedVC, BOOL animated, id completion) {
+    if (presentedVC && is_cdkey_alert(presentedVC)) {
+        NSLog(@"[xinyue] [*] BLOCKING presentation of CDKey alert");
+        // Frida: args[4] = ptr(NULL) -> set completion to NULL
+        if (g_presentVC_orig) {
+            ((void(*)(id, SEL, id, BOOL, id))g_presentVC_orig)
+                (self, _cmd, presentedVC, animated, NULL);
+        }
+    } else {
+        // Call original normally
+        if (g_presentVC_orig) {
+            ((void(*)(id, SEL, id, BOOL, id))g_presentVC_orig)
+                (self, _cmd, presentedVC, animated, completion);
+        }
+    }
+}
+
+// --- viewDidAppear: Interceptor.attach onEnter -> auto-dismiss CDKey alerts ---
+static IMP g_viewDidAppear_orig = NULL;
+
+static void viewDidAppear_hook(id self, SEL _cmd, BOOL animated) {
+    if (g_viewDidAppear_orig) {
+        ((void(*)(id, SEL, BOOL))g_viewDidAppear_orig)(self, _cmd, animated);
+    }
+
+    // Check if this is a CDKey alert
+    Class cls = object_getClass(self);
+    if (cls && strcmp(class_getName(cls), "UIAlertController") == 0) {
+        if (is_cdkey_alert(self)) {
+            NSLog(@"[xinyue] [*] Auto-dismissing CDKey alert");
+            // dismissViewControllerAnimated:completion:
+            SEL dismissSel = sel_registerName("dismissViewControllerAnimated:completion:");
+            [self performSelector:dismissSel withObject:@YES withObject:nil];
+        }
+    }
+}
+
+#pragma mark - ObjC hook installer
+
+static void hook_objc_methods(void) {
+    // === ViewController hooks ===
+    Class vc = objc_getClass("ViewController");
+    if (!vc) {
+        NSLog(@"[xinyue] WARNING: ViewController not found, retrying later");
+        return;
+    }
+    NSLog(@"[xinyue] [+] ViewController found");
+
+    // showLaunchScreen -> no-op (Interceptor.replace)
+    SEL showSel = sel_registerName("showLaunchScreen");
+    Method showMethod = class_getInstanceMethod(vc, showSel);
+    if (showMethod) {
+        class_replaceMethod(vc, showSel, (IMP)showLaunchScreen_replacement, "v@:");
+        NSLog(@"[xinyue] [+] showLaunchScreen replaced no-op");
+    }
+
+    // applyRuntimeState -> force authPassed=YES (Interceptor.attach onEnter)
+    SEL applySel = sel_registerName("applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:");
+    Method applyMethod = class_getInstanceMethod(vc, applySel);
+    if (applyMethod) {
+        g_applyRuntimeState_orig = method_getImplementation(applyMethod);
+        class_replaceMethod(vc, applySel, (IMP)applyRuntimeState_hook, "v@:BBBB");
+        NSLog(@"[xinyue] [+] applyRuntimeState hooked (authPassed=YES)");
+    }
+
+    // pollActivationThenReveal -> just log (Interceptor.attach)
+    // We don't need to modify it, just let it run
+
+    // === presentViewController -> block CDKey alerts ===
+    Class uivcClass = objc_getClass("UIViewController");
+    if (uivcClass) {
+        SEL presentSel = sel_registerName("presentViewController:animated:completion:");
+        Method presentMethod = class_getInstanceMethod(uivcClass, presentSel);
+        if (presentMethod) {
+            g_presentVC_orig = method_getImplementation(presentMethod);
+            class_replaceMethod(uivcClass, presentSel, (IMP)presentViewController_hook, "v@:@B@");
+            NSLog(@"[xinyue] [+] presentViewController hook installed");
+        }
+
+        // viewDidAppear -> auto-dismiss CDKey alerts
+        SEL vdaSel = sel_registerName("viewDidAppear:");
+        Method vdaMethod = class_getInstanceMethod(uivcClass, vdaSel);
+        if (vdaMethod) {
+            g_viewDidAppear_orig = method_getImplementation(vdaMethod);
+            class_replaceMethod(uivcClass, vdaSel, (IMP)viewDidAppear_hook, "v@:B");
+            NSLog(@"[xinyue] [+] viewDidAppear hook for auto-dismiss");
+        }
+    }
+}
+
+#pragma mark - Constructor
+
 __attribute__((constructor))
-static void xinyue_gadget_init(void) {
+static void xinyue_crack_init(void) {
     @autoreleasepool {
-        NSLog(@"[xinyue-gadget] === Loader starting ===");
+        NSLog(@"[xinyue] === Crack dylib v6-port loaded ===");
 
-        // Step 1: Get writable directory (app's Documents or tmp)
-        NSString *scriptDir = nil;
-
-        // Try NSTemporaryDirectory first
-        NSString *tmpDir = NSTemporaryDirectory();
-        if (tmpDir) {
-            scriptDir = tmpDir;
-        }
-
-        // Try Documents directory as fallback
-        if (!scriptDir) {
-            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-            if (paths.count > 0) {
-                scriptDir = paths[0];
-            }
-        }
-
-        if (!scriptDir) {
-            NSLog(@"[xinyue-gadget] ERROR: No writable directory found");
-            return;
-        }
-
-        NSLog(@"[xinyue-gadget] Script dir: %@", scriptDir);
-
-        // Step 2: Write embedded JS script to file
-        NSString *scriptPath = [scriptDir stringByAppendingPathComponent:@"xinyue_hook.js"];
-        NSString *scriptContent = getEmbeddedScript();
-        NSError *writeError = nil;
-        BOOL ok = [scriptContent writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
-        if (!ok || writeError) {
-            NSLog(@"[xinyue-gadget] ERROR: Failed to write script: %@", writeError);
-            return;
-        }
-        NSLog(@"[xinyue-gadget] Script written to: %@", scriptPath);
-
-        // Step 3: Write Frida Gadget config file
-        // Config tells Gadget to load our script in "script" interaction mode
-        NSString *configPath = [scriptDir stringByAppendingPathComponent:@"FridaGadget.config"];
-        NSDictionary *config = @{
-            @"interaction": @{
-                @"type": @"script",
-                @"path": scriptPath,
-                @"on_change": @"reload"
-            }
-        };
-        NSData *configData = [NSJSONSerialization dataWithJSONObject:config options:0 error:nil];
-        NSString *configStr = [[NSString alloc] initWithData:configData encoding:NSUTF8StringEncoding];
-        [configStr writeToFile:configPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[xinyue-gadget] Config written to: %@", configPath);
-
-        // Step 4: Find and dlopen frida-gadget.dylib
-        // Search common locations
-        NSArray *searchPaths = @[
-            // Same directory as this dylib (Frameworks/)
-            @"@executable_path/Frameworks/frida-gadget.dylib",
-            @"@rpath/frida-gadget.dylib",
-            @"@executable_path/Frameworks/libfrida-gadget.dylib",
-            // Absolute paths for jailbreak
-            @"/Library/MobileSubstrate/DynamicLibraries/frida-gadget.dylib",
-            @"/usr/lib/frida-gadget.dylib",
-            // tmp dir (where we might have copied it)
-            [scriptDir stringByAppendingPathComponent:@"frida-gadget.dylib"],
-        ];
-
-        void *gadgetHandle = NULL;
-        for (NSString *path in searchPaths) {
-            NSLog(@"[xinyue-gadget] Trying: %@", path);
-            gadgetHandle = dlopen([path UTF8String], RTLD_NOW);
-            if (gadgetHandle) {
-                NSLog(@"[xinyue-gadget] Loaded frida-gadget from: %@", path);
-                break;
-            }
-        }
-
-        if (!gadgetHandle) {
-            const char *err = dlerror();
-            NSLog(@"[xinyue-gadget] WARNING: frida-gadget.dylib not found. Will retry on next runloop. dlerror: %s", err ? err : "(null)");
-
-            // Retry on next runloop tick (gadget might be loaded later by LC_LOAD_DYLIB)
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                NSLog(@"[xinyue-gadget] Retrying dlopen...");
-                void *handle = NULL;
-                for (NSString *path in searchPaths) {
-                    handle = dlopen([path UTF8String], RTLD_NOW);
-                    if (handle) {
-                        NSLog(@"[xinyue-gadget] Loaded frida-gadget (retry) from: %@", path);
-                        break;
-                    }
-                }
-                if (!handle) {
-                    NSLog(@"[xinyue-gadget] FAILED: frida-gadget.dylib not found anywhere. Make sure it's injected alongside this dylib.");
-                }
+        uintptr_t base = get_image_base();
+        if (base == 0) {
+            NSLog(@"[xinyue] ERROR: image base not found, will retry");
+            // Retry on next runloop
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                          dispatch_get_main_queue(), ^{
+                xinyue_crack_init();
             });
             return;
         }
+        NSLog(@"[xinyue] Image base: 0x%lx", base);
 
-        NSLog(@"[xinyue-gadget] === Frida Gadget loaded, script injected ===");
+        // ========== 1. REPLACE sub_F14144v -> return 1 ==========
+        // Try export first, then offset
+        uintptr_t addr = find_export("_Z10sub_F14144v");
+        if (addr) {
+            patch_return_one(addr, "sub_F14144v");
+        } else {
+            patch_return_one(base + 0x5cacac, "sub_F14144v");
+        }
+
+        // ========== 2. REPLACE _LFVerifyNetworkActivation -> return 1 ==========
+        addr = find_export("_LFVerifyNetworkActivation");
+        if (addr) {
+            patch_return_one(addr, "LFVerifyNetworkActivation");
+        } else {
+            patch_return_one(base + 0x4870, "LFVerifyNetworkActivation");
+        }
+
+        // ========== 3. Hook LFVerifierExpiryText -> return 2099 date ==========
+        patch_expiry_text(base);
+
+        // ========== 4. SKIP sub_65D614v dialog builder ==========
+        patch_skip_dialog(base, 0x58be8, "sub_65D614v (CDKey dialog builder)");
+
+        // ========== 5. ObjC hooks ==========
+        hook_objc_methods();
+
+        // Retry ObjC hooks on next runloop (ViewController might not be loaded yet)
+        dispatch_async(dispatch_get_main_queue(), ^{
+            hook_objc_methods();
+        });
+
+        NSLog(@"[xinyue] === All hooks v6 installed ===");
     }
 }
