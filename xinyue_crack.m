@@ -1,104 +1,70 @@
 // xinyue_crack.dylib - Permanent crack for com.nbxy.app
-// Pure C + ObjC runtime, no MobileSubstrate dependency
+// Uses MobileSubstrate MSHookFunction + ObjC runtime (越狱环境)
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
-#import <mach/mach.h>
 #import <dlfcn.h>
 
-// extern declaration - header path varies across SDKs
-extern void sys_icache_invalidate(void *address, size_t length);
+// MobileSubstrate API
+extern "C" void MSHookFunction(void *symbol, void *replacement, void **result);
+extern "C" void *MSGetImageByName(const char *name);
 
 // ============================================================
-// Get image base address for the main binary
+// Get function address by offset from image base
 // ============================================================
-static uintptr_t get_image_base(void) {
-    // Try to find module named "xyld" first
+static void *get_func_addr(uintptr_t offset) {
+    // Try to find the "xyld" image via MSGetImageByName
+    void *image = MSGetImageByName("xyld");
+    if (image) {
+        return (void *)((uintptr_t)image + offset);
+    }
+    
+    // Fallback: scan dyld images
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "xyld")) {
-            return (uintptr_t)_dyld_get_image_header(i);
+            return (void *)((uintptr_t)_dyld_get_image_header(i) + offset);
         }
     }
-    // Fallback: main executable (MH_EXECUTE)
+    
+    // Last resort: main executable
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const struct mach_header *hdr = _dyld_get_image_header(i);
         if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
-            return (uintptr_t)hdr;
+            return (void *)((uintptr_t)hdr + offset);
         }
     }
-    return 0;
+    return NULL;
 }
 
 // ============================================================
-// Write code patch using vm_protect + memcpy + icache flush
-// Returns true if patch verified successfully (readback matches)
+// Replacement functions for C functions
 // ============================================================
-static bool write_code_patch(uintptr_t addr, const void *data, size_t size) {
-    // Try 16KB pages first (arm64), then 4KB
-    vm_address_t page;
-    vm_size_t pageSize;
-    
-    // Try 16KB page alignment
-    page = addr & ~0x3FFFULL;
-    pageSize = 0x4000;
-    
-    kern_return_t kr = vm_protect(mach_task_self(), page, pageSize,
-                                   FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        // Try 4KB page alignment
-        page = addr & ~0xFFFULL;
-        pageSize = 0x1000;
-        kr = vm_protect(mach_task_self(), page, pageSize,
-                       FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        if (kr != KERN_SUCCESS) {
-            NSLog(@"[xinyue] vm_protect WRITE failed: %d at 0x%lx", kr, addr);
-            return false;
-        }
-    }
 
-    // Write the patch
-    memcpy((void *)addr, data, size);
-
-    // Restore to read+execute only
-    vm_protect(mach_task_self(), page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-
-    // Flush instruction cache
-    sys_icache_invalidate((void *)addr, size);
-
-    // Verify patch by reading back
-    if (memcmp((void *)addr, data, size) != 0) {
-        NSLog(@"[xinyue] Patch verify FAILED at 0x%lx", addr);
-        return false;
-    }
-    
-    return true;
+// Replacement for _LFVerifyNetworkActivation - always return 1
+static int (*orig_LFVerifyNetworkActivation)(void) = NULL;
+static int hook_LFVerifyNetworkActivation(void) {
+    return 1;
 }
 
-// ============================================================
-// Patch 1: Make function return 1
-// ARM64: MOV W0, #1 (0x52800020) ; RET (0xD65F03C0)
-// ============================================================
-static void patch_return_one(uintptr_t addr) {
-    uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };
-    bool ok = write_code_patch(addr, insns, sizeof(insns));
-    NSLog(@"[xinyue] patch_return_one @ 0x%lx -> %s", addr, ok ? "OK" : "FAILED");
+// Replacement for sub_F14144v - always return 1
+static int (*orig_sub_F14144v)(void) = NULL;
+static int hook_sub_F14144v(void) {
+    return 1;
 }
 
-// ============================================================
-// Patch 2: Skip dialog builder, preserve tail-call
-// Patch B instruction at offset+0x08 to jump to offset+0x88
-// ============================================================
-static void patch_skip_dialog(uintptr_t funcAddr) {
-    uintptr_t patchAddr = funcAddr + 0x08;
-    uintptr_t targetAddr = funcAddr + 0x88;
-    int32_t branchImm = (int32_t)(targetAddr - patchAddr) / 4;
-    uint32_t bInsn = 0x14000000U | ((uint32_t)branchImm & 0x03FFFFFFU);
-    bool ok = write_code_patch(patchAddr, &bInsn, sizeof(bInsn));
-    NSLog(@"[xinyue] patch_skip_dialog @ 0x%lx -> B 0x%lx (0x%08x) -> %s", 
-          patchAddr, targetAddr, bInsn, ok ? "OK" : "FAILED");
+// Replacement for sub_65D614v - skip dialog build, call through to renderer
+// The original function: builds CDKey dialog, then tail-calls sub_94E80Dv
+// We skip the dialog building entirely and just call sub_94E80Dv directly
+// sub_94E80Dv is at offset 0x5cae14
+static int (*orig_sub_65D614v)(void) = NULL;
+static int hook_sub_65D614v(void) {
+    // Don't build the dialog at all - just return 1
+    // The renderer (sub_94E80Dv) is called separately in the ImGui draw loop
+    // via drawInMTKView, so we don't need to call it here
+    return 1;
 }
 
 // ============================================================
@@ -108,7 +74,7 @@ static IMP g_showLaunchScreen_orig = NULL;
 static IMP g_applyRuntimeState_orig = NULL;
 
 static void showLaunchScreen_replacement(id self, SEL _cmd) {
-    // no-op - block launch screen / CDKey dialog
+    // no-op - block launch screen
 }
 
 static void applyRuntimeState_replacement(id self, SEL _cmd, BOOL envReady, BOOL hudRunning, BOOL canExploit, BOOL authPassed) {
@@ -118,69 +84,75 @@ static void applyRuntimeState_replacement(id self, SEL _cmd, BOOL envReady, BOOL
 }
 
 // ============================================================
-// ObjC hooks - done in a dispatch block to ensure classes are loaded
+// Hook ObjC methods
 // ============================================================
 static void hook_objc_methods(void) {
     Class viewControllerClass = objc_getClass("ViewController");
     if (!viewControllerClass) {
-        NSLog(@"[xinyue] WARNING: ViewController class not found");
+        NSLog(@"[xinyue] WARNING: ViewController not found");
         return;
     }
     NSLog(@"[xinyue] ViewController found");
 
-    // Replace showLaunchScreen with no-op
+    // showLaunchScreen -> no-op
     SEL showSel = sel_registerName("showLaunchScreen");
     Method showMethod = class_getInstanceMethod(viewControllerClass, showSel);
     if (showMethod) {
         g_showLaunchScreen_orig = method_getImplementation(showMethod);
         class_replaceMethod(viewControllerClass, showSel, (IMP)showLaunchScreen_replacement, "v@:");
-        NSLog(@"[xinyue] showLaunchScreen replaced with no-op");
+        NSLog(@"[xinyue] showLaunchScreen replaced");
     }
 
-    // Hook applyRuntimeState to force authPassed=YES
+    // applyRuntimeState -> force authPassed=YES
     SEL applySel = sel_registerName("applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:");
     Method applyMethod = class_getInstanceMethod(viewControllerClass, applySel);
     if (applyMethod) {
         g_applyRuntimeState_orig = method_getImplementation(applyMethod);
         class_replaceMethod(viewControllerClass, applySel, (IMP)applyRuntimeState_replacement, "v@:BBBB");
-        NSLog(@"[xinyue] applyRuntimeState hooked -> force authPassed=YES");
+        NSLog(@"[xinyue] applyRuntimeState hooked");
     }
 }
 
 // ============================================================
-// Constructor - runs when dylib is loaded
+// Constructor
 // ============================================================
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
     @autoreleasepool {
-        NSLog(@"[xinyue] === Crack dylib v2.0 loaded ===");
+        NSLog(@"[xinyue] === Crack dylib v3.0 loaded ===");
 
-        // ---- Patch C functions immediately (binary code is already mapped) ----
-        uintptr_t base = get_image_base();
-        if (base == 0) {
-            NSLog(@"[xinyue] ERROR: Could not find image base");
-            return;
+        // ---- 1. Hook C functions via MSHookFunction ----
+        // These match exactly what Frida's Interceptor.replace does
+        
+        // _LFVerifyNetworkActivation (offset 0x4870) -> return 1
+        void *verifyAddr = get_func_addr(0x4870);
+        if (verifyAddr) {
+            MSHookFunction(verifyAddr, (void *)hook_LFVerifyNetworkActivation, (void **)&orig_LFVerifyNetworkActivation);
+            NSLog(@"[xinyue] LFVerifyNetworkActivation hooked @ 0x%lx", (uintptr_t)verifyAddr);
         }
-        NSLog(@"[xinyue] Image base: 0x%lx", base);
 
-        // 1. Patch _LFVerifyNetworkActivation (offset 0x4870)
-        patch_return_one(base + 0x4870);
+        // sub_F14144v (offset 0x5cacac) -> return 1
+        void *subAddr = get_func_addr(0x5cacac);
+        if (subAddr) {
+            MSHookFunction(subAddr, (void *)hook_sub_F14144v, (void **)&orig_sub_F14144v);
+            NSLog(@"[xinyue] sub_F14144v hooked @ 0x%lx", (uintptr_t)subAddr);
+        }
 
-        // 2. Patch sub_F14144v (offset 0x5cacac)
-        patch_return_one(base + 0x5cacac);
+        // sub_65D614v (offset 0x58be8) -> return 1 (skip dialog, don't call renderer)
+        void *dialogAddr = get_func_addr(0x58be8);
+        if (dialogAddr) {
+            MSHookFunction(dialogAddr, (void *)hook_sub_65D614v, (void **)&orig_sub_65D614v);
+            NSLog(@"[xinyue] sub_65D614v hooked @ 0x%lx", (uintptr_t)dialogAddr);
+        }
 
-        // 3. Patch sub_65D614v (offset 0x58be8) - skip dialog builder
-        patch_skip_dialog(base + 0x58be8);
-
-        // ---- ObjC hooks - defer to next runloop to ensure classes are registered ----
-        // Try immediately first
+        // ---- 2. ObjC method hooks ----
         hook_objc_methods();
 
-        // Also schedule a retry on next runloop in case classes aren't loaded yet
+        // Retry on next runloop in case classes aren't loaded yet
         dispatch_async(dispatch_get_main_queue(), ^{
             hook_objc_methods();
         });
 
-        NSLog(@"[xinyue] === All patches applied ===");
+        NSLog(@"[xinyue] === All hooks installed ===");
     }
 }
