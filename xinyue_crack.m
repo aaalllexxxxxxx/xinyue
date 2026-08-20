@@ -1,134 +1,138 @@
-// xinyue_crack.dylib - Self-contained Frida Gadget Injector
+// xinyue_crack.dylib - Pure ObjC implementation of hook_activation.js v6
 //
-// 把 frida-gadget.dylib（已签名）和 JS 脚本嵌入数据段，
-// constructor 中释放到 App 沙盒目录并 dlopen 加载，自动执行 hook。
+// 只做 3 个 C 函数 patch（和 Frida 的 Memory.patchCode/Interceptor.replace 等价）
+// 不做 ObjC hook（之前 class_replaceMethod 导致闪退）
+// 延迟到 main queue 执行（确保所有模块加载完成）
 //
-// 用户只需注入这一个 dylib 即可完成破解。
-//
-// 编译时：
-//   1. 下载 frida-gadget，lipo 提取 arm64，ldid -S 签名
-//   2. 用 Python 脚本把签名后的 frida-gadget 转为 C 数组 (frida_gadget_data.h)
-//   3. 把 FridaGadget.js 转为 C 数组 (frida_js_data.h)
-//   4. clang 编译
+// 3 个核心 patch：
+//   1. _LFVerifyNetworkActivation -> MOV W0,#1; RET  (验证始终成功)
+//   2. sub_F14144v -> MOV W0,#1; RET                (验证子函数始终成功)
+//   3. sub_65D614v -> B 指令跳过弹窗构建            (无卡密弹窗)
 
 #import <Foundation/Foundation.h>
-#import <dlfcn.h>
-#import <fcntl.h>
-#import <sys/stat.h>
+#import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <unistd.h>
-#import <string.h>
+#import <mach/mach.h>
+#import <dispatch/dispatch.h>
 
-// 数据段中的嵌入数据（编译时生成）
-// frida_gadget_data 已包含 ad-hoc 签名
-#include "frida_gadget_data.h"
-#include "frida_js_data.h"
+extern void sys_icache_invalidate(void *address, size_t size);
 
-// 写入数据到文件
-static bool write_file(const char *path, const unsigned char *data, unsigned long size, mode_t mode) {
-    unlink(path);
+// 内存 patch - 等价于 Frida 的 Memory.patchCode
+static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
+    // iOS 16K page size
+    vm_address_t page = addr & ~0x3FFFULL;
+    vm_size_t pageSize = 0x4000;
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0) {
-        NSLog(@"[xinyue] Failed to create %s: %s", path, strerror(errno));
-        return false;
-    }
-
-    size_t totalWritten = 0;
-    while (totalWritten < size) {
-        ssize_t written = write(fd, data + totalWritten, size - totalWritten);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            NSLog(@"[xinyue] Write failed %s: %s (%zu/%zu)", path, strerror(errno), totalWritten, size);
-            close(fd);
+    kern_return_t kr = vm_protect(mach_task_self(), page, pageSize,
+                                   FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        // Try 4K page
+        page = addr & ~0xFFFULL;
+        pageSize = 0x1000;
+        kr = vm_protect(mach_task_self(), page, pageSize,
+                       FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            NSLog(@"[xinyue] vm_protect FAILED at 0x%lx kr=%d", (unsigned long)addr, kr);
             return false;
         }
-        totalWritten += written;
     }
-    close(fd);
-    chmod(path, mode);
-    NSLog(@"[xinyue] Wrote %s (%zu bytes)", path, totalWritten);
+
+    memcpy((void *)addr, data, size);
+    // Restore RX (remove W)
+    vm_protect(mach_task_self(), page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate((void *)addr, size);
+
+    // Verify
+    if (memcmp((void *)addr, data, size) != 0) {
+        NSLog(@"[xinyue] patch verify FAILED at 0x%lx", (unsigned long)addr);
+        return false;
+    }
     return true;
 }
 
-// 生成 frida-gadget config 文件
-static bool write_config_file(const char *configPath, const char *scriptName) {
-    char buf[512];
-    int len = snprintf(buf, sizeof(buf),
-        "{\n"
-        "  \"interaction\": {\n"
-        "    \"type\": \"script\",\n"
-        "    \"path\": \"%s\",\n"
-        "    \"on_change\": \"reload\"\n"
-        "  }\n"
-        "}\n",
-        scriptName
-    );
-    if (len <= 0 || (size_t)len >= sizeof(buf)) return false;
-    return write_file(configPath, (const unsigned char *)buf, (unsigned long)len, 0644);
+// 获取 xyld 模块基址
+static uintptr_t get_xyld_base(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "xyld")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    // Fallback: 找主可执行文件
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
+            return (uintptr_t)hdr;
+        }
+    }
+    return 0;
+}
+
+// Patch: 让函数直接返回 1
+// ARM64: MOV W0, #1 (0x52800020) ; RET (0xD65F03C0)
+// 等价于 Frida: Interceptor.replace(addr, new NativeCallback(function(){return 1}, 'int', []))
+static void patch_return_one(uintptr_t addr, const char *label) {
+    uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };
+    bool ok = patch_memory(addr, insns, sizeof(insns));
+    NSLog(@"[xinyue] %s @ 0x%lx -> MOV W0,#1; RET [%s]", label, (unsigned long)addr, ok ? "OK" : "FAIL");
+}
+
+// Patch: 跳过弹窗构建，保留 tail-call
+// 等价于 Frida v6: Memory.patchCode 写 B 指令
+// sub_65D614v 结构:
+//   0x00: STP X29,X30,[SP,#-0x10]!  (栈帧)
+//   0x04: MOV X29, SP
+//   0x08..0x84: 弹窗构建调用
+//   0x88: LDP X29,X30,[SP],#0x10    (恢复栈帧)
+//   0x8C: B sub_94E80Dv              (tail-call 到 ImGui 渲染器)
+// 在 offset+0x08 处写 B 指令跳到 offset+0x88
+static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *label) {
+    uintptr_t patchAddr = base + offset + 0x08;
+    uintptr_t targetAddr = base + offset + 0x88;
+    int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
+    uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
+    bool ok = patch_memory(patchAddr, &bInsn, 4);
+    NSLog(@"[xinyue] %s @ 0x%lx -> B 0x%lx (0x%08x) [%s]",
+          label, (unsigned long)patchAddr, (unsigned long)targetAddr, bInsn, ok ? "OK" : "FAIL");
+}
+
+// 所有 patch 逻辑
+static void apply_all_patches(void) {
+    NSLog(@"[xinyue] === applying patches ===");
+
+    uintptr_t base = get_xyld_base();
+    if (base == 0) {
+        NSLog(@"[xinyue] ERROR: xyld base not found, retrying...");
+        // 延迟重试
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            apply_all_patches();
+        });
+        return;
+    }
+    NSLog(@"[xinyue] xyld base: 0x%lx", (unsigned long)base);
+
+    // 1. _LFVerifyNetworkActivation (offset 0x4870) -> return 1
+    patch_return_one(base + 0x4870, "LFVerifyNetworkActivation");
+
+    // 2. sub_F14144v (offset 0x5cacac) -> return 1
+    patch_return_one(base + 0x5cacac, "sub_F14144v");
+
+    // 3. sub_65D614v (offset 0x58be8) -> skip dialog builder
+    patch_skip_dialog(base, 0x58be8, "sub_65D614v skip dialog");
+
+    NSLog(@"[xinyue] === all patches applied ===");
 }
 
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
     @autoreleasepool {
-        NSLog(@"[xinyue] === self-contained crack dylib loaded ===");
+        NSLog(@"[xinyue] === crack dylib loaded ===");
 
-        // 1. 获取 App 沙盒可写目录
-        NSString *cachesDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:cachesDir withIntermediateDirectories:YES attributes:nil error:nil];
-        const char *dir = [cachesDir UTF8String];
-        NSLog(@"[xinyue] Release dir: %s", dir);
-
-        // 2. 构建路径
-        char gadgetPath[1024], scriptPath[1024], configPath[1024];
-        snprintf(gadgetPath,   sizeof(gadgetPath),   "%s/.xinyue_gadget.dylib", dir);
-        snprintf(scriptPath,   sizeof(scriptPath),   "%s/.xinyue_gadget.js",    dir);
-        snprintf(configPath,   sizeof(configPath),   "%s/.xinyue_gadget.config", dir);
-
-        // 3. 释放 frida-gadget（已在编译时签名）
-        NSLog(@"[xinyue] Extracting frida-gadget (%u bytes)...", (unsigned int)frida_gadget_data_len);
-        if (!write_file(gadgetPath, frida_gadget_data, frida_gadget_data_len, 0755)) {
-            NSLog(@"[xinyue] FATAL: Cannot extract frida-gadget");
-            return;
-        }
-
-        // 4. 释放 JS 脚本
-        NSLog(@"[xinyue] Extracting JS script (%u bytes)...", (unsigned int)frida_js_data_len);
-        if (!write_file(scriptPath, frida_js_data, frida_js_data_len, 0644)) {
-            NSLog(@"[xinyue] FATAL: Cannot extract JS script");
-            return;
-        }
-
-        // 5. 生成 config（frida-gadget 根据 dylib 文件名查找同名 .config）
-        if (!write_config_file(configPath, ".xinyue_gadget.js")) {
-            NSLog(@"[xinyue] FATAL: Cannot create config");
-            return;
-        }
-
-        // 6. dlopen frida-gadget
-        // frida-gadget constructor 会读取 config → 找到 JS → 执行 hook
-        NSLog(@"[xinyue] dlopen(%s)...", gadgetPath);
-
-        dlerror();
-        void *handle = dlopen(gadgetPath, RTLD_NOW);
-        if (!handle) {
-            const char *err = dlerror();
-            NSLog(@"[xinyue] dlopen failed: %s", err ? err : "unknown");
-
-            // 重试
-            NSLog(@"[xinyue] Retrying...");
-            usleep(500000);
-            dlerror();
-            handle = dlopen(gadgetPath, RTLD_NOW);
-            if (!handle) {
-                err = dlerror();
-                NSLog(@"[xinyue] Retry failed: %s", err ? err : "unknown");
-            }
-        }
-
-        if (handle) {
-            NSLog(@"[xinyue] === frida-gadget loaded ===");
-        }
+        // 延迟到 main queue 执行，确保所有模块已加载
+        // Frida 脚本是在进程启动后才执行的，这里也模拟同样的时机
+        dispatch_async(dispatch_get_main_queue(), ^{
+            apply_all_patches();
+        });
     }
 }
