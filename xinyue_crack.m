@@ -128,9 +128,10 @@ static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *labe
 // 但更简单的方法：patch LFVerifierExpiryText 让它直接调用我们的函数
 
 // 我们的替代函数：返回 "2099-12-31 23:59:59"
-static NSString *g_fakeExpiry = nil;
+// 用 CFString 常量避免 ARC 全局变量问题
+static CFStringRef g_fakeExpiry = CFSTR("2099-12-31 23:59:59");
 static id __attribute__((noinline)) expiry_text_replacement(void) {
-    return g_fakeExpiry;
+    return (__bridge id)g_fakeExpiry;
 }
 
 // Patch LFVerifierExpiryText: 用 B 指令跳转到我们的替代函数
@@ -349,8 +350,7 @@ static void apply_all_patches(void) {
     }
     NSLog(@"[xinyue] xyld base: 0x%lx", (unsigned long)base);
 
-    // 初始化假日期字符串
-    g_fakeExpiry = [@"2099-12-31 23:59:59" retain];
+    // 假日期字符串已用 CFSTR 常量初始化，无需额外操作
 
     // ========== 1. C 函数 patch: sub_F14144v -> return 1 ==========
     patch_return_one(base + 0x5cacac, "sub_F14144v");
