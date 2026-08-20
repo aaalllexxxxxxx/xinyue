@@ -12,101 +12,9 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Download frida-gadget
-      run: |
-        set -e
-
-        # Try multiple versions in case one fails
-        for VER in "16.7.0" "16.6.0" "16.5.0" "16.4.0" "16.3.0" "16.2.0" "16.1.0" "16.0.0"; do
-          URL="https://github.com/frida/frida/releases/download/${VER}/frida-gadget-${VER}-ios-universal.dylib.gz"
-          echo "Trying ${URL}..."
-          if curl -fSL --connect-timeout 30 --max-time 300 -o frida-gadget.dylib.gz "${URL}"; then
-            FRIDA_VERSION="${VER}"
-            echo "Found frida-gadget version ${VER}"
-            break
-          fi
-        done
-
-        if [ ! -f frida-gadget.dylib.gz ] || [ ! -s frida-gadget.dylib.gz ]; then
-          echo "ERROR: Could not download frida-gadget from any version!"
-          exit 1
-        fi
-
-        # Decompress
-        gunzip -f frida-gadget.dylib.gz
-
-        # Extract arm64 slice only (reduces size significantly)
-        echo "=== Before lipo ==="
-        ls -lh frida-gadget.dylib
-        lipo -extract arm64 frida-gadget.dylib -output frida-gadget-arm64.dylib
-        mv -f frida-gadget-arm64.dylib frida-gadget.dylib
-
-        echo "=== After lipo (arm64 only) ==="
-        file frida-gadget.dylib
-        ls -lh frida-gadget.dylib
-
-    - name: Pre-sign frida-gadget (before embedding)
-      run: |
-        set -e
-        # Sign the frida-gadget arm64 slice BEFORE embedding it into data section
-        # This way the released dylib on iOS will already have a valid ad-hoc signature
-        if command -v ldid &> /dev/null; then
-          ldid -S frida-gadget.dylib
-          echo "Pre-signed frida-gadget with ldid"
-        else
-          codesign -f -s - frida-gadget.dylib
-          echo "Pre-signed frida-gadget with codesign"
-        fi
-        echo "=== Verify frida-gadget signature ==="
-        codesign -dvvv frida-gadget.dylib 2>&1 || true
-        ls -lh frida-gadget.dylib
-
-    - name: Generate embedded data headers
-      run: |
-        set -e
-
-        # Use Python to generate C headers (more reliable than xxd -n)
-        python3 << 'PYEOF'
-        import os
-
-        def gen_header(input_file, var_name, output_file):
-            with open(input_file, 'rb') as f:
-                data = f.read()
-
-            with open(output_file, 'w') as out:
-                out.write(f'// Auto-generated from {input_file}\n')
-                out.write(f'// Do not edit manually\n\n')
-                out.write(f'unsigned char {var_name}[] = {{\n')
-
-                for i in range(0, len(data), 12):
-                    chunk = data[i:i+12]
-                    hex_vals = ', '.join(f'0x{b:02x}' for b in chunk)
-                    out.write(f'  {hex_vals},\n')
-
-                out.write(f'}};\n')
-                out.write(f'unsigned int {var_name}_len = {len(data)};\n')
-
-            size = os.path.getsize(output_file)
-            print(f'Generated {output_file}: {size} bytes ({len(data)} data bytes)')
-
-        gen_header('frida-gadget.dylib', 'frida_gadget_data', 'frida_gadget_data.h')
-        gen_header('FridaGadget.js', 'frida_js_data', 'frida_js_data.h')
-        PYEOF
-
-        # Verify
-        echo "=== frida_gadget_data.h (first 5 lines) ==="
-        head -5 frida_gadget_data.h
-        echo "=== frida_js_data.h (first 5 lines) ==="
-        head -5 frida_js_data.h
-        echo "=== frida_gadget_data.h (last 3 lines) ==="
-        tail -3 frida_gadget_data.h
-
     - name: Find source file
       run: |
         SRC=$(find . -name "xinyue_crack.m" | head -1)
-        if [ -z "$SRC" ]; then
-          SRC=$(find . -name "*.m" | head -1)
-        fi
         if [ -z "$SRC" ]; then
           echo "ERROR: No .m source file found!"
           exit 1
@@ -128,7 +36,6 @@ jobs:
           -isysroot "$SDK_PATH" \
           -dynamiclib \
           -framework Foundation \
-          -framework UIKit \
           -fobjc-arc \
           -Wall -Wno-deprecated-declarations \
           -miphoneos-version-min=14.0 \
@@ -142,7 +49,6 @@ jobs:
 
     - name: Sign dylib
       run: |
-        # Ad-hoc sign the wrapper dylib
         if command -v ldid &> /dev/null; then
           ldid -S xinyue_crack.dylib
           echo "Signed with ldid"
@@ -161,8 +67,6 @@ jobs:
         otool -L xinyue_crack.dylib
         echo "=== Size ==="
         ls -lh xinyue_crack.dylib
-        echo "=== Segments ==="
-        otool -l xinyue_crack.dylib | grep -A5 "segname"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
