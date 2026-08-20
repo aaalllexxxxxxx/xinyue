@@ -1,6 +1,6 @@
 // xinyue_crack.dylib - Permanent crack for com.nbxy.app
-// No compile-time dependency on MobileSubstrate
-// Uses dlsym to load MSHookFunction at runtime, falls back to vm_protect patching
+// Mirrors Frida v6 exactly: all patches use vm_protect + memcpy (same as Memory.patchCode)
+// NO MSHookFunction - pure memory patching only
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -10,12 +10,6 @@
 #import <dlfcn.h>
 
 extern void sys_icache_invalidate(void *address, size_t length);
-
-// ============================================================
-// MSHookFunction type (loaded via dlsym at runtime)
-// ============================================================
-typedef void (*MSHookFunction_t)(void *symbol, void *replacement, void **result);
-static MSHookFunction_t g_MSHookFunction = NULL;
 
 // ============================================================
 // Get image base address
@@ -37,9 +31,10 @@ static uintptr_t get_image_base(void) {
 }
 
 // ============================================================
-// Fallback: direct memory patch (when MSHookFunction unavailable)
+// Memory patch - equivalent to Frida's Memory.patchCode
 // ============================================================
 static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
+    // Try 16KB page (arm64) first, then 4KB
     vm_address_t page = addr & ~0x3FFFULL;
     vm_size_t pageSize = 0x4000;
     
@@ -51,15 +46,17 @@ static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
         kr = vm_protect(mach_task_self(), page, pageSize,
                        FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
         if (kr != KERN_SUCCESS) {
-            NSLog(@"[xinyue] vm_protect failed: %d", kr);
+            NSLog(@"[xinyue] vm_protect WRITE failed: %d at 0x%lx", kr, addr);
             return false;
         }
     }
     
     memcpy((void *)addr, data, size);
+    
     vm_protect(mach_task_self(), page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate((void *)addr, size);
     
+    // Verify
     if (memcmp((void *)addr, data, size) != 0) {
         NSLog(@"[xinyue] patch verify FAILED at 0x%lx", addr);
         return false;
@@ -68,46 +65,44 @@ static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
 }
 
 // ============================================================
-// Hook functions
+// Patch 1: Make function return 1
+// ARM64: MOV W0, #1 (0x52800020) ; RET (0xD65F03C0)
+// Same as Frida: Interceptor.replace(addr, new NativeCallback(function(){return 1}, 'int', []))
 // ============================================================
-
-// _LFVerifyNetworkActivation -> return 1
-static int (*orig_LFVerifyNetworkActivation)(void) = NULL;
-static int hook_LFVerifyNetworkActivation(void) {
-    return 1;
+static void patch_return_one(uintptr_t addr) {
+    uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };  // MOV W0, #1; RET
+    bool ok = patch_memory(addr, insns, sizeof(insns));
+    NSLog(@"[xinyue] patch_return_one @ 0x%lx -> %s", addr, ok ? "OK" : "FAILED");
 }
 
-// sub_F14144v -> return 1
-static int (*orig_sub_F14144v)(void) = NULL;
-static int hook_sub_F14144v(void) {
-    return 1;
-}
-
-// sub_65D614v -> skip dialog, call sub_94E80Dv (renderer)
-// sub_94E80Dv at offset 0x5cae14
-static int (*orig_sub_65D614v)(void) = NULL;
-typedef int (*renderer_t)(void);
-static renderer_t g_renderer = NULL;
-
-static int hook_sub_65D614v(void) {
-    // Skip dialog building, but call the renderer (original tail-call target)
-    if (g_renderer) {
-        return g_renderer();
-    }
-    return 1;
+// ============================================================
+// Patch 2: Skip dialog builder, preserve tail-call
+// Same as Frida v6: Memory.patchCode writes B instruction at offset+0x08
+// jumping to offset+0x88 (LDP X29,X30), then B sub_94E80Dv executes naturally
+// ============================================================
+static void patch_skip_dialog(uintptr_t funcAddr) {
+    uintptr_t patchAddr = funcAddr + 0x08;
+    uintptr_t targetAddr = funcAddr + 0x88;
+    int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
+    uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
+    bool ok = patch_memory(patchAddr, &bInsn, 4);
+    NSLog(@"[xinyue] patch_skip_dialog @ 0x%lx -> B 0x%lx (0x%08x) -> %s",
+          patchAddr, targetAddr, bInsn, ok ? "OK" : "FAILED");
 }
 
 // ============================================================
 // ObjC method replacements
+// Same as Frida: Interceptor.replace(impl, new NativeCallback(...))
 // ============================================================
 static IMP g_showLaunchScreen_orig = NULL;
 static IMP g_applyRuntimeState_orig = NULL;
 
 static void showLaunchScreen_replacement(id self, SEL _cmd) {
-    // no-op
+    // no-op - Frida: console.log("[*] showLaunchScreen BLOCKED")
 }
 
 static void applyRuntimeState_replacement(id self, SEL _cmd, BOOL envReady, BOOL hudRunning, BOOL canExploit, BOOL authPassed) {
+    // Frida: args[5] = ptr(1)  -> force authPassed=YES
     if (g_applyRuntimeState_orig) {
         ((void(*)(id, SEL, BOOL, BOOL, BOOL, BOOL))g_applyRuntimeState_orig)(self, _cmd, envReady, hudRunning, canExploit, YES);
     }
@@ -121,6 +116,7 @@ static void hook_objc_methods(void) {
     }
     NSLog(@"[xinyue] ViewController found");
 
+    // showLaunchScreen -> no-op
     SEL showSel = sel_registerName("showLaunchScreen");
     Method showMethod = class_getInstanceMethod(vc, showSel);
     if (showMethod) {
@@ -129,6 +125,7 @@ static void hook_objc_methods(void) {
         NSLog(@"[xinyue] showLaunchScreen replaced");
     }
 
+    // applyRuntimeState -> force authPassed=YES
     SEL applySel = sel_registerName("applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:");
     Method applyMethod = class_getInstanceMethod(vc, applySel);
     if (applyMethod) {
@@ -139,36 +136,12 @@ static void hook_objc_methods(void) {
 }
 
 // ============================================================
-// Helper: hook or patch a function
-// ============================================================
-static void hook_function(const char *name, uintptr_t addr, void *hook, void **orig) {
-    if (g_MSHookFunction) {
-        // Use MobileSubstrate (preferred - same mechanism as Frida)
-        g_MSHookFunction((void *)addr, hook, orig);
-        NSLog(@"[xinyue] %s hooked via MSHook @ 0x%lx", name, addr);
-    } else {
-        // Fallback: direct memory patch with MOV W0,#1; RET
-        uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };
-        bool ok = patch_memory(addr, insns, sizeof(insns));
-        NSLog(@"[xinyue] %s patched via vm_protect @ 0x%lx -> %s", name, addr, ok ? "OK" : "FAILED");
-    }
-}
-
-// ============================================================
 // Constructor
 // ============================================================
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
     @autoreleasepool {
-        NSLog(@"[xinyue] === Crack dylib v3.0 loaded ===");
-
-        // Load MSHookFunction via dlsym (MobileSubstrate is on jailbroken devices)
-        g_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-        if (g_MSHookFunction) {
-            NSLog(@"[xinyue] MobileSubstrate MSHookFunction loaded");
-        } else {
-            NSLog(@"[xinyue] MSHookFunction not found, using vm_protect fallback");
-        }
+        NSLog(@"[xinyue] === Crack dylib v4.0 loaded ===");
 
         uintptr_t base = get_image_base();
         if (base == 0) {
@@ -177,40 +150,26 @@ static void xinyue_crack_init(void) {
         }
         NSLog(@"[xinyue] Image base: 0x%lx", base);
 
-        // Get renderer address (sub_94E80Dv at offset 0x5cae14)
-        g_renderer = (renderer_t)(base + 0x5cae14);
+        // ---- C function patches (same as Frida v6 Memory.patchCode) ----
 
-        // 1. _LFVerifyNetworkActivation (0x4870) -> return 1
-        hook_function("LFVerifyNetworkActivation", base + 0x4870,
-                      (void *)hook_LFVerifyNetworkActivation, (void **)&orig_LFVerifyNetworkActivation);
+        // 1. _LFVerifyNetworkActivation (offset 0x4870) -> MOV W0,#1; RET
+        patch_return_one(base + 0x4870);
 
-        // 2. sub_F14144v (0x5cacac) -> return 1
-        hook_function("sub_F14144v", base + 0x5cacac,
-                      (void *)hook_sub_F14144v, (void **)&orig_sub_F14144v);
+        // 2. sub_F14144v (offset 0x5cacac) -> MOV W0,#1; RET
+        patch_return_one(base + 0x5cacac);
 
-        // 3. sub_65D614v (0x58be8) -> skip dialog, call renderer
-        // For MSHookFunction: use our hook that calls g_renderer
-        // For vm_protect fallback: patch B instruction (same as Frida v6)
-        if (g_MSHookFunction) {
-            g_MSHookFunction((void *)(base + 0x58be8), (void *)hook_sub_65D614v, (void **)&orig_sub_65D614v);
-            NSLog(@"[xinyue] sub_65D614v hooked via MSHook @ 0x%lx", base + 0x58be8);
-        } else {
-            // Fallback: patch B instruction at offset+0x08 -> jump to offset+0x88
-            // This skips dialog build but preserves LDP + B sub_94E80Dv
-            uintptr_t patchAddr = base + 0x58be8 + 0x08;
-            uintptr_t targetAddr = base + 0x58be8 + 0x88;
-            int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
-            uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
-            bool ok = patch_memory(patchAddr, &bInsn, 4);
-            NSLog(@"[xinyue] sub_65D614v patched @ 0x%lx -> B 0x%lx -> %s", patchAddr, targetAddr, ok ? "OK" : "FAILED");
-        }
+        // 3. sub_65D614v (offset 0x58be8) -> B instruction skip dialog
+        //    Same as Frida v6: Memory.patchCode(patchAddr, 4, writeU32(bInsn))
+        patch_skip_dialog(base + 0x58be8);
 
-        // 4. ObjC hooks
+        // ---- ObjC method hooks (same as Frida Interceptor.replace) ----
         hook_objc_methods();
+
+        // Retry on next runloop
         dispatch_async(dispatch_get_main_queue(), ^{
             hook_objc_methods();
         });
 
-        NSLog(@"[xinyue] === All hooks installed ===");
+        NSLog(@"[xinyue] === All patches applied ===");
     }
 }
