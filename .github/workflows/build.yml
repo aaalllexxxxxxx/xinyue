@@ -2,9 +2,6 @@ name: Build xinyue_crack.dylib
 
 on:
   push:
-    paths:
-      - 'xinyue_crack/**'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
@@ -15,22 +12,29 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Select Xcode
-      run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    - name: Find source file
+      run: |
+        echo "=== Repository structure ==="
+        find . -name "*.x" -o -name "*.m" | head -20
+        SRC=$(find . -name "xinyue_crack.x" | head -1)
+        if [ -z "$SRC" ]; then
+          echo "No xinyue_crack.x found, searching for any .x or .m file..."
+          SRC=$(find . -name "*.x" -o -name "*.m" | head -1)
+        fi
+        echo "SOURCE_FILE=$SRC" >> $GITHUB_ENV
+        echo "Found source: $SRC"
 
     - name: Get SDK path
-      id: sdk
       run: |
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-        echo "path=$SDK_PATH" >> $GITHUB_OUTPUT
+        echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
         echo "SDK Path: $SDK_PATH"
 
     - name: Compile dylib (arm64)
-      working-directory: xinyue_crack
       run: |
         clang \
           -arch arm64 \
-          -isysroot "${{ steps.sdk.outputs.path }}" \
+          -isysroot "$SDK_PATH" \
           -dynamiclib \
           -flat_namespace \
           -framework Foundation \
@@ -40,18 +44,16 @@ jobs:
           -miphoneos-version-min=14.0 \
           -install_name @rpath/xinyue_crack.dylib \
           -o xinyue_crack.dylib \
-          xinyue_crack.x
+          "$SOURCE_FILE"
 
     - name: Verify dylib
-      working-directory: xinyue_crack
       run: |
         file xinyue_crack.dylib
         otool -L xinyue_crack.dylib
-        nm -U xinyue_crack.dylib | grep -i xinyue
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: xinyue_crack.dylib
-        path: xinyue_crack/xinyue_crack.dylib
+        path: xinyue_crack.dylib
         retention-days: 90
