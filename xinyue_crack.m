@@ -2,7 +2,11 @@
 //
 // 只做 3 个 C 函数 patch（和 Frida 的 Memory.patchCode/Interceptor.replace 等价）
 // 不做 ObjC hook（之前 class_replaceMethod 导致闪退）
-// 延迟到 main queue 执行（确保所有模块加载完成）
+//
+// 关键：在 constructor 中直接同步执行 patch，不用 dispatch_async！
+// 因为 constructor 执行时机比 main() 和 applicationDidFinishLaunching 都早，
+// 这时验证函数还没被调用，patch 来得及。
+// 之前用 dispatch_async 延迟到 main queue，导致 patch 在验证之后才执行 -> 没效果。
 //
 // 3 个核心 patch：
 //   1. _LFVerifyNetworkActivation -> MOV W0,#1; RET  (验证始终成功)
@@ -51,20 +55,35 @@ static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
 }
 
 // 获取 xyld 模块基址
+// 在 constructor 执行时，主二进制已经加载，可以直接找到
 static uintptr_t get_xyld_base(void) {
+    // 方法1: 按名称查找（路径中包含 "xyld"）
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "xyld")) {
+            NSLog(@"[xinyue] found xyld module[%d]: %s", i, name);
             return (uintptr_t)_dyld_get_image_header(i);
         }
     }
-    // Fallback: 找主可执行文件
+
+    // 方法2: 找主可执行文件（MH_EXECUTE 类型）
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const struct mach_header *hdr = _dyld_get_image_header(i);
         if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
+            NSLog(@"[xinyue] found MH_EXECUTE module[%d]: %s", i, _dyld_get_image_name(i));
             return (uintptr_t)hdr;
         }
     }
+
+    // 方法3: 遍历所有模块，找第一个非 dylib 的
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        const char *name = _dyld_get_image_name(i);
+        if (hdr && hdr->magic == MH_MAGIC_64) {
+            NSLog(@"[xinyue] module[%d] filetype=%d: %s", i, hdr->filetype, name ? name : "(null)");
+        }
+    }
+
     return 0;
 }
 
@@ -72,9 +91,14 @@ static uintptr_t get_xyld_base(void) {
 // ARM64: MOV W0, #1 (0x52800020) ; RET (0xD65F03C0)
 // 等价于 Frida: Interceptor.replace(addr, new NativeCallback(function(){return 1}, 'int', []))
 static void patch_return_one(uintptr_t addr, const char *label) {
+    // 先读原始字节用于日志
+    uint32_t orig[2];
+    memcpy(orig, (void *)addr, 8);
+
     uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };
     bool ok = patch_memory(addr, insns, sizeof(insns));
-    NSLog(@"[xinyue] %s @ 0x%lx -> MOV W0,#1; RET [%s]", label, (unsigned long)addr, ok ? "OK" : "FAIL");
+    NSLog(@"[xinyue] %s @ 0x%lx (orig: %08x %08x) -> MOV W0,#1; RET [%s]",
+          label, (unsigned long)addr, orig[0], orig[1], ok ? "OK" : "FAIL");
 }
 
 // Patch: 跳过弹窗构建，保留 tail-call
@@ -89,11 +113,16 @@ static void patch_return_one(uintptr_t addr, const char *label) {
 static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *label) {
     uintptr_t patchAddr = base + offset + 0x08;
     uintptr_t targetAddr = base + offset + 0x88;
+
+    // 先读原始字节
+    uint32_t orig;
+    memcpy(&orig, (void *)patchAddr, 4);
+
     int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
     uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
     bool ok = patch_memory(patchAddr, &bInsn, 4);
-    NSLog(@"[xinyue] %s @ 0x%lx -> B 0x%lx (0x%08x) [%s]",
-          label, (unsigned long)patchAddr, (unsigned long)targetAddr, bInsn, ok ? "OK" : "FAIL");
+    NSLog(@"[xinyue] %s @ 0x%lx (orig: %08x) -> B 0x%lx (0x%08x) [%s]",
+          label, (unsigned long)patchAddr, orig, (unsigned long)targetAddr, bInsn, ok ? "OK" : "FAIL");
 }
 
 // 所有 patch 逻辑
@@ -102,12 +131,7 @@ static void apply_all_patches(void) {
 
     uintptr_t base = get_xyld_base();
     if (base == 0) {
-        NSLog(@"[xinyue] ERROR: xyld base not found, retrying...");
-        // 延迟重试
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            apply_all_patches();
-        });
+        NSLog(@"[xinyue] ERROR: xyld base not found!");
         return;
     }
     NSLog(@"[xinyue] xyld base: 0x%lx", (unsigned long)base);
@@ -126,13 +150,9 @@ static void apply_all_patches(void) {
 
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
-    @autoreleasepool {
-        NSLog(@"[xinyue] === crack dylib loaded ===");
-
-        // 延迟到 main queue 执行，确保所有模块已加载
-        // Frida 脚本是在进程启动后才执行的，这里也模拟同样的时机
-        dispatch_async(dispatch_get_main_queue(), ^{
-            apply_all_patches();
-        });
-    }
+    // 在 constructor 中直接同步执行 patch！
+    // constructor 执行时机比 main() 和 +load 都早，
+    // 这时验证函数还没被调用，patch 来得及。
+    // 不用 dispatch_async，因为延迟到 main queue 会导致 patch 在验证之后才执行。
+    apply_all_patches();
 }
