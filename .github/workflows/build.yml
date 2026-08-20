@@ -14,14 +14,13 @@ jobs:
 
     - name: Find source file
       run: |
-        echo "=== Repository structure ==="
-        find . -name "*.m" -o -name "*.x" | head -20
+        find . -name "*.m" | head -20
         SRC=$(find . -name "xinyue_crack.m" | head -1)
         if [ -z "$SRC" ]; then
-          SRC=$(find . -name "xinyue_crack.x" | head -1)
+          SRC=$(find . -name "*.m" | head -1)
         fi
         if [ -z "$SRC" ]; then
-          echo "ERROR: No source file found!"
+          echo "ERROR: No .m source file found!"
           exit 1
         fi
         echo "SOURCE_FILE=$SRC" >> $GITHUB_ENV
@@ -31,7 +30,6 @@ jobs:
       run: |
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
         echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
-        echo "SDK Path: $SDK_PATH"
 
     - name: Compile dylib (arm64)
       run: |
