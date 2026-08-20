@@ -1,4 +1,4 @@
-name: Build xinyue_gadget.dylib
+name: Build xinyue_crack.dylib
 
 on:
   push:
@@ -31,107 +31,41 @@ jobs:
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
         echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
 
-    - name: Download frida-gadget.dylib (arm64)
-      run: |
-        # Get latest frida-gadget for ios-arm64
-        # Try specific version first, then latest
-        FRIDA_VERSION="16.5.9"
-        URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-ios-arm64.dylib.xz"
-        echo "Downloading from: $URL"
-        curl -L -o frida-gadget.dylib.xz "$URL"
-        
-        # Verify download
-        if [ ! -s frida-gadget.dylib.xz ]; then
-          echo "Download failed, trying alternative version..."
-          FRIDA_VERSION="16.1.10"
-          URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-ios-arm64.dylib.xz"
-          echo "Downloading from: $URL"
-          curl -L -o frida-gadget.dylib.xz "$URL"
-        fi
-        
-        if [ ! -s frida-gadget.dylib.xz ]; then
-          echo "ERROR: Failed to download frida-gadget"
-          exit 1
-        fi
-        
-        # Decompress
-        xz -d frida-gadget.dylib.xz
-        ls -la frida-gadget.dylib
-        file frida-gadget.dylib
-
-    - name: Compile loader dylib (arm64)
+    - name: Compile dylib (arm64)
       run: |
         clang \
           -arch arm64 \
           -isysroot "$SDK_PATH" \
           -dynamiclib \
           -framework Foundation \
+          -framework UIKit \
           -fobjc-arc \
           -Wall -Wno-deprecated-declarations \
           -miphoneos-version-min=14.0 \
-          -install_name @rpath/xinyue_gadget.dylib \
-          -o xinyue_gadget.dylib \
+          -install_name @rpath/xinyue_crack.dylib \
+          -o xinyue_crack.dylib \
           "$SOURCE_FILE"
 
-    - name: Sign dylibs with ldid (fake sign for jailbreak/TrollStore)
+    - name: Sign dylib
       run: |
-        # Install ldid if not available
-        if ! command -v ldid &> /dev/null; then
-          brew install ldid 2>/dev/null || true
-        fi
-        
-        # Sign both dylibs
+        # Try ldid first, then codesign
         if command -v ldid &> /dev/null; then
-          ldid -S xinyue_gadget.dylib
-          ldid -S frida-gadget.dylib
+          ldid -S xinyue_crack.dylib
           echo "Signed with ldid"
         else
-          echo "ldid not found, skipping codesign (will use codesign instead)"
-          codesign -f -s - xinyue_gadget.dylib 2>/dev/null || true
-          codesign -f -s - frida-gadget.dylib 2>/dev/null || true
+          codesign -f -s - xinyue_crack.dylib 2>/dev/null || true
+          echo "Signed with codesign"
         fi
 
-    - name: Verify dylibs
+    - name: Verify dylib
       run: |
-        echo "=== xinyue_gadget.dylib ==="
-        file xinyue_gadget.dylib
-        otool -L xinyue_gadget.dylib
-        echo ""
-        echo "=== frida-gadget.dylib ==="
-        file frida-gadget.dylib
-        otool -L frida-gadget.dylib | head -5
-
-    - name: Package both dylibs
-      run: |
-        mkdir -p artifact
-        cp xinyue_gadget.dylib artifact/
-        cp frida-gadget.dylib artifact/
-        # Create a README for injection
-        cat > artifact/INJECT_README.txt << 'EOF'
-        === Xinyue Crack - Frida Gadget Edition ===
-        
-        Two dylibs needed:
-        1. xinyue_gadget.dylib  - Loader, embeds JS hook script in data segment
-        2. frida-gadget.dylib   - Frida Gadget runtime (arm64)
-        
-        Both must be injected into the target app.
-        
-        For TrollStore + TrollFools:
-        - Inject BOTH dylibs into com.nbxy.app
-        
-        For jailbreak (MobileSubstrate):
-        - Copy both to /Library/MobileSubstrate/DynamicLibraries/
-        - The loader will find frida-gadget via dlopen search paths
-        
-        For IPA insertion:
-        - Place both in Payload/xyld.app/Frameworks/
-        - Add LC_LOAD_DYLIB for both to the main binary
-        EOF
-        ls -la artifact/
+        file xinyue_crack.dylib
+        otool -L xinyue_crack.dylib
+        otool -hv xinyue_crack.dylib
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: xinyue_gadget
-        path: artifact/
+        name: xinyue_crack.dylib
+        path: xinyue_crack.dylib
         retention-days: 90
