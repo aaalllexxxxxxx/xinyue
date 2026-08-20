@@ -36,6 +36,7 @@ jobs:
           -isysroot "$SDK_PATH" \
           -dynamiclib \
           -framework Foundation \
+          -framework UIKit \
           -fobjc-arc \
           -Wall -Wno-deprecated-declarations \
           -miphoneos-version-min=14.0 \
