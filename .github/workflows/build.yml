@@ -45,26 +45,61 @@ jobs:
         file frida-gadget.dylib
         ls -lh frida-gadget.dylib
 
+    - name: Pre-sign frida-gadget (before embedding)
+      run: |
+        set -e
+        # Sign the frida-gadget arm64 slice BEFORE embedding it into data section
+        # This way the released dylib on iOS will already have a valid ad-hoc signature
+        if command -v ldid &> /dev/null; then
+          ldid -S frida-gadget.dylib
+          echo "Pre-signed frida-gadget with ldid"
+        else
+          codesign -f -s - frida-gadget.dylib
+          echo "Pre-signed frida-gadget with codesign"
+        fi
+        echo "=== Verify frida-gadget signature ==="
+        codesign -dvvv frida-gadget.dylib 2>&1 || true
+        ls -lh frida-gadget.dylib
+
     - name: Generate embedded data headers
       run: |
         set -e
 
-        # Generate C array from frida-gadget.dylib (arm64 only)
-        # xxd -i -n NAME creates: unsigned char NAME[] = { ... }; unsigned int NAME_len = N;
-        echo "Generating frida_gadget_data.h..."
-        xxd -i -n frida_gadget_data frida-gadget.dylib > frida_gadget_data.h
-        echo "frida_gadget_data.h: $(wc -c < frida_gadget_data.h) bytes"
+        # Use Python to generate C headers (more reliable than xxd -n)
+        python3 << 'PYEOF'
+        import os
 
-        # Generate frida_js_data.h from FridaGadget.js
-        echo "Generating frida_js_data.h..."
-        xxd -i -n frida_js_data FridaGadget.js > frida_js_data.h
-        echo "frida_js_data.h: $(wc -c < frida_js_data.h) bytes"
+        def gen_header(input_file, var_name, output_file):
+            with open(input_file, 'rb') as f:
+                data = f.read()
 
-        # Verify format
-        echo "=== frida_gadget_data.h (first 3 lines) ==="
-        head -3 frida_gadget_data.h
-        echo "=== frida_js_data.h (first 3 lines) ==="
-        head -3 frida_js_data.h
+            with open(output_file, 'w') as out:
+                out.write(f'// Auto-generated from {input_file}\n')
+                out.write(f'// Do not edit manually\n\n')
+                out.write(f'unsigned char {var_name}[] = {{\n')
+
+                for i in range(0, len(data), 12):
+                    chunk = data[i:i+12]
+                    hex_vals = ', '.join(f'0x{b:02x}' for b in chunk)
+                    out.write(f'  {hex_vals},\n')
+
+                out.write(f'}};\n')
+                out.write(f'unsigned int {var_name}_len = {len(data)};\n')
+
+            size = os.path.getsize(output_file)
+            print(f'Generated {output_file}: {size} bytes ({len(data)} data bytes)')
+
+        gen_header('frida-gadget.dylib', 'frida_gadget_data', 'frida_gadget_data.h')
+        gen_header('FridaGadget.js', 'frida_js_data', 'frida_js_data.h')
+        PYEOF
+
+        # Verify
+        echo "=== frida_gadget_data.h (first 5 lines) ==="
+        head -5 frida_gadget_data.h
+        echo "=== frida_js_data.h (first 5 lines) ==="
+        head -5 frida_js_data.h
+        echo "=== frida_gadget_data.h (last 3 lines) ==="
+        tail -3 frida_gadget_data.h
 
     - name: Find source file
       run: |
@@ -88,8 +123,6 @@ jobs:
       run: |
         set -e
 
-        # Compile the wrapper dylib with embedded frida-gadget data
-        # The .m source already #includes the generated headers
         clang \
           -arch arm64 \
           -isysroot "$SDK_PATH" \
@@ -128,6 +161,8 @@ jobs:
         otool -L xinyue_crack.dylib
         echo "=== Size ==="
         ls -lh xinyue_crack.dylib
+        echo "=== Segments ==="
+        otool -l xinyue_crack.dylib | grep -A5 "segname"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
