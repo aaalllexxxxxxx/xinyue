@@ -15,11 +15,14 @@ jobs:
     - name: Find source file
       run: |
         echo "=== Repository structure ==="
-        find . -name "*.x" -o -name "*.m" | head -20
-        SRC=$(find . -name "xinyue_crack.x" | head -1)
+        find . -name "*.m" -o -name "*.x" | head -20
+        SRC=$(find . -name "xinyue_crack.m" | head -1)
         if [ -z "$SRC" ]; then
-          echo "No xinyue_crack.x found, searching for any .x or .m file..."
-          SRC=$(find . -name "*.x" -o -name "*.m" | head -1)
+          SRC=$(find . -name "xinyue_crack.x" | head -1)
+        fi
+        if [ -z "$SRC" ]; then
+          echo "ERROR: No source file found!"
+          exit 1
         fi
         echo "SOURCE_FILE=$SRC" >> $GITHUB_ENV
         echo "Found source: $SRC"
@@ -36,7 +39,6 @@ jobs:
           -arch arm64 \
           -isysroot "$SDK_PATH" \
           -dynamiclib \
-          -flat_namespace \
           -framework Foundation \
           -framework UIKit \
           -fobjc-arc \
