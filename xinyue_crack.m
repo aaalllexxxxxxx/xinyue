@@ -1,23 +1,18 @@
 // xinyue_crack.dylib - Complete ObjC translation of hook_activation.js v6
 //
-// 完整翻译 JS 脚本的所有 hook 点：
-//   1. C 函数 patch: _LFVerifyNetworkActivation, sub_F14144v -> return 1
-//   2. C 函数 patch: sub_65D614v -> B 指令跳过弹窗构建
-//   3. C 函数 hook: LFVerifierExpiryText -> 返回 "2099-12-31 23:59:59"
-//   4. ObjC hook: ViewController showLaunchScreen -> no-op
-//   5. ObjC hook: ViewController applyRuntimeState -> 强制 authPassed=YES
-//   6. ObjC hook: UIViewController presentViewController -> 拦截卡密弹窗
-//   7. ObjC hook: UIViewController viewDidAppear -> 自动关闭弹窗
-//
-// 关键：constructor 中直接同步执行所有 patch，不用 dispatch_async
-// 因为 constructor 执行时机比 main() 早，这时验证函数还没被调用
+// 完整翻译 JS 脚本的所有 hook 点
+// 关键修复：
+//   1. C 函数 patch 在 constructor 中同步执行（时机最早）
+//   2. ObjC hooks 在 +load 中执行（确保类已注册）
+//   3. 优先用 dlsym 获取导出符号，失败再用 base+offset
+//   4. patch 后立即验证，日志输出确认结果
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
-#import <dispatch/dispatch.h>
+#import <dlfcn.h>
 
 extern void sys_icache_invalidate(void *address, size_t size);
 
@@ -26,14 +21,12 @@ extern void sys_icache_invalidate(void *address, size_t size);
 // ============================================================================
 
 static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
-    // iOS 16K page size
     vm_address_t page = addr & ~0x3FFFULL;
     vm_size_t pageSize = 0x4000;
 
     kern_return_t kr = vm_protect(mach_task_self(), page, pageSize,
                                    FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
-        // Try 4K page
         page = addr & ~0xFFFULL;
         pageSize = 0x1000;
         kr = vm_protect(mach_task_self(), page, pageSize,
@@ -48,6 +41,7 @@ static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
     vm_protect(mach_task_self(), page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate((void *)addr, size);
 
+    // Verify
     if (memcmp((void *)addr, data, size) != 0) {
         NSLog(@"[xinyue] patch verify FAILED at 0x%lx", (unsigned long)addr);
         return false;
@@ -55,21 +49,46 @@ static bool patch_memory(uintptr_t addr, const void *data, size_t size) {
     return true;
 }
 
+// 获取 xyld 模块基址
 static uintptr_t get_xyld_base(void) {
+    NSLog(@"[xinyue] scanning %d modules for xyld...", (int)_dyld_image_count());
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "xyld")) {
-            return (uintptr_t)_dyld_get_image_header(i);
-        }
-    }
-    // Fallback: 找主可执行文件
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const struct mach_header *hdr = _dyld_get_image_header(i);
-        if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
+        if (name && strstr(name, "xyld")) {
+            NSLog(@"[xinyue] found xyld [%d]: %s (hdr=%p)", i, name, hdr);
             return (uintptr_t)hdr;
         }
     }
+    // Fallback: 找 MH_EXECUTE
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        if (hdr && hdr->magic == MH_MAGIC_64 && hdr->filetype == MH_EXECUTE) {
+            const char *name = _dyld_get_image_name(i);
+            NSLog(@"[xinyue] found MH_EXECUTE [%d]: %s (hdr=%p)", i, name ? name : "(null)", hdr);
+            return (uintptr_t)hdr;
+        }
+    }
+    // 打印所有模块用于调试
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        NSLog(@"[xinyue] mod[%d] type=%d magic=0x%x: %s", i,
+              hdr ? hdr->filetype : -1, hdr ? hdr->magic : 0, name ? name : "(null)");
+    }
     return 0;
+}
+
+// 用 dlsym 获取导出符号地址
+static uintptr_t resolve_export(const char *symbol) {
+    void *addr = dlsym(RTLD_DEFAULT, symbol);
+    if (!addr) {
+        // 尝试带下划线前缀
+        char buf[256];
+        snprintf(buf, sizeof(buf), "_%s", symbol);
+        addr = dlsym(RTLD_DEFAULT, buf);
+    }
+    return (uintptr_t)addr;
 }
 
 // ============================================================================
@@ -81,21 +100,19 @@ static uintptr_t get_xyld_base(void) {
 static void patch_return_one(uintptr_t addr, const char *label) {
     uint32_t orig[2];
     memcpy(orig, (void *)addr, 8);
+    NSLog(@"[xinyue] %s: before patch orig=%08x %08x", label, orig[0], orig[1]);
 
     uint32_t insns[2] = { 0x52800020, 0xD65F03C0 };
     bool ok = patch_memory(addr, insns, sizeof(insns));
-    NSLog(@"[xinyue] %s @ 0x%lx (orig: %08x %08x) -> MOV W0,#1; RET [%s]",
-          label, (unsigned long)addr, orig[0], orig[1], ok ? "OK" : "FAIL");
+
+    // 验证
+    uint32_t after[2];
+    memcpy(after, (void *)addr, 8);
+    NSLog(@"[xinyue] %s @ 0x%lx -> MOV W0,#1; RET [%s] after=%08x %08x",
+          label, (unsigned long)addr, ok ? "OK" : "FAIL", after[0], after[1]);
 }
 
 // Patch: 跳过弹窗构建，保留 tail-call
-// sub_65D614v 结构:
-//   0x00: STP X29,X30,[SP,#-0x10]!  (栈帧)
-//   0x04: MOV X29, SP
-//   0x08..0x84: 弹窗构建调用
-//   0x88: LDP X29,X30,[SP],#0x10    (恢复栈帧)
-//   0x8C: B sub_94E80Dv              (tail-call 到 ImGui 渲染器)
-// 在 offset+0x08 处写 B 指令跳到 offset+0x88
 static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *label) {
     uintptr_t patchAddr = base + offset + 0x08;
     uintptr_t targetAddr = base + offset + 0x88;
@@ -106,116 +123,85 @@ static void patch_skip_dialog(uintptr_t base, uintptr_t offset, const char *labe
     int32_t imm = (int32_t)(targetAddr - patchAddr) / 4;
     uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
     bool ok = patch_memory(patchAddr, &bInsn, 4);
-    NSLog(@"[xinyue] %s @ 0x%lx (orig: %08x) -> B 0x%lx (0x%08x) [%s]",
-          label, (unsigned long)patchAddr, orig, (unsigned long)targetAddr, bInsn, ok ? "OK" : "FAIL");
+
+    uint32_t after;
+    memcpy(&after, (void *)patchAddr, 4);
+    NSLog(@"[xinyue] %s @ 0x%lx orig=%08x -> B 0x%lx (0x%08x) [%s] after=%08x",
+          label, (unsigned long)patchAddr, orig, (unsigned long)targetAddr, bInsn,
+          ok ? "OK" : "FAIL", after);
 }
 
 // ============================================================================
 // C 函数 hook: LFVerifierExpiryText -> 返回假日期字符串
-// 等价于 Frida Interceptor.attach onLeave: retval.replace(fakeStr)
-// 实现方式：在函数返回路径上 patch，让它直接返回我们的假字符串
-// 但因为 LFVerifierExpiryText 返回的是一个全局缓存的 NSString*，
-// 我们用更简单的方法：直接 patch 函数为 MOV X0, #addr; RET
-// 不过因为返回的是 Objective-C 对象指针，我们需要返回一个常量字符串
-//
-// 更好的方案：用 fishhook 或 inline hook 来拦截返回值
-// 但最简单可靠的方案：直接 patch 函数让它返回一个固定的 NSString
-// 我们在 dylib 中创建一个静态 NSString，然后让函数返回它
 // ============================================================================
 
-// 由于 ARM64 的 MOV 指令无法直接加载 64 位地址到 X0，
-// 我们需要用 ADRP+ADD 或 LDR 方式。
-// 但更简单的方法：patch LFVerifierExpiryText 让它直接调用我们的函数
-
-// 我们的替代函数：返回 "2099-12-31 23:59:59"
-// 用 CFString 常量避免 ARC 全局变量问题
 static CFStringRef g_fakeExpiry = CFSTR("2099-12-31 23:59:59");
+
 static id __attribute__((noinline)) expiry_text_replacement(void) {
+    NSLog(@"[xinyue] LFVerifierExpiryText called -> returning fake date");
     return (__bridge id)g_fakeExpiry;
 }
 
-// Patch LFVerifierExpiryText: 用 B 指令跳转到我们的替代函数
-// ARM64 B 指令可以跳转 ±128MB 范围
 static void patch_expiry_text(uintptr_t funcAddr, const char *label) {
-    // 读原始字节
     uint32_t orig[4];
     memcpy(orig, (void *)funcAddr, 16);
 
     uintptr_t target = (uintptr_t)expiry_text_replacement;
     int64_t diff = (int64_t)target - (int64_t)funcAddr;
 
-    // 检查是否在 B 指令的跳转范围内 (±128MB)
-    if (diff > 0x7FFFFFFLL || diff < -0x8000000LL) {
-        // 超出 B 指令范围，用 LDR + BR 方式
-        // 这种情况下不能简单 patch，需要更复杂的 trampoline
-        // 但实际上 dylib 和主二进制在同一进程空间，距离应该在范围内
-        NSLog(@"[xinyue] %s: target out of B range (diff=0x%llx), trying LDR approach", label, diff);
+    NSLog(@"[xinyue] %s: func=0x%lx target=0x%lx diff=0x%llx", label,
+          (unsigned long)funcAddr, (unsigned long)target, diff);
 
-        // 用 ADRP + BR 的方式（但需要可写的 trampoline 区域）
-        // 退而求其次：直接 patch 成返回 nil（让调用方走 null 路径）
-        // 实际上 JS 脚本就是在 retval.isNull() 时替换，所以返回 nil 也能触发
-        // 但我们改为直接返回假字符串更好
-        // 尝试用 BL 方式（26 位偏移，±64MB）
-        // 如果不行就放弃这个 patch
-        NSLog(@"[xinyue] %s: falling back to return-nil patch", label);
-        // MOV X0, #0 ; RET = return nil
+    // B 指令范围: ±128MB
+    if (diff > 0x7FFFFFFLL || diff < -0x8000000LL) {
+        NSLog(@"[xinyue] %s: out of B range, falling back to return-nil", label);
+        // 返回 nil 让 JS 的 onLeave 逻辑生效（JS 在 retval.isNull() 时替换）
+        // 但这里没有 JS，返回 nil 可能让调用方出问题
+        // 改为：patch 成 RET nil，让上层走未激活路径
         uint32_t insns[2] = { 0xD2800000, 0xD65F03C0 }; // MOV X0,#0; RET
         bool ok = patch_memory(funcAddr, insns, sizeof(insns));
         NSLog(@"[xinyue] %s @ 0x%lx -> MOV X0,#0; RET [%s]", label, (unsigned long)funcAddr, ok ? "OK" : "FAIL");
         return;
     }
 
-    // 计算偏移（以指令为单位，即字节数 / 4）
     int32_t imm = (int32_t)(diff / 4);
     uint32_t bInsn = 0x14000000U | ((uint32_t)imm & 0x03FFFFFFU);
     bool ok = patch_memory(funcAddr, &bInsn, 4);
-    NSLog(@"[xinyue] %s @ 0x%lx (orig: %08x) -> B 0x%lx (0x%08x) [%s]",
-          label, (unsigned long)funcAddr, orig[0], (unsigned long)target, bInsn, ok ? "OK" : "FAIL");
+
+    uint32_t after;
+    memcpy(&after, (void *)funcAddr, 4);
+    NSLog(@"[xinyue] %s @ 0x%lx orig=%08x -> B 0x%lx (0x%08x) [%s] after=%08x",
+          label, (unsigned long)funcAddr, orig[0], (unsigned long)target, bInsn,
+          ok ? "OK" : "FAIL", after);
 }
 
 // ============================================================================
-// ObjC hooks (等价于 Frida Interceptor.attach/replace on ObjC methods)
+// ObjC hooks
 // ============================================================================
 
-// --- 4. showLaunchScreen -> no-op ---
-// 等价于 Frida: Interceptor.replace(impl, new NativeCallback(function(self,cmd){}, 'void', ['pointer','pointer']))
+// --- showLaunchScreen -> no-op ---
 static void showLaunchScreen_replacement(id self, SEL _cmd) {
     NSLog(@"[xinyue] showLaunchScreen BLOCKED");
-    // no-op - 不做任何事
 }
 
-// --- 5. applyRuntimeState -> 强制 authPassed=YES ---
-// 等价于 Frida: Interceptor.attach(impl, { onEnter: function(args){ args[5]=ptr(1); } })
-// 方法签名: - (void)applyRuntimeStateWithEnvironmentReady:(BOOL)envReady
-//                                              hudRunning:(BOOL)hudRunning
-//                                      canExploitLocally:(BOOL)canExploit
-//                                                authPassed:(BOOL)authPassed
-// ObjC 方法参数布局: args[0]=self, args[1]=_cmd, args[2]=envReady, args[3]=hudRunning,
-//                    args[4]=canExploit, args[5]=authPassed
-// Frida 中 args[5]=ptr(1) 就是把 authPassed 参数改为 1 (YES)
+// --- applyRuntimeState -> 强制 authPassed=YES ---
 static void (*applyRuntimeState_original)(id, SEL, BOOL, BOOL, BOOL, BOOL) = NULL;
 static void applyRuntimeState_hook(id self, SEL _cmd, BOOL envReady, BOOL hudRunning, BOOL canExploit, BOOL authPassed) {
-    NSLog(@"[xinyue] applyRuntimeState -> authPassed forced to YES (was %d)", authPassed);
+    NSLog(@"[xinyue] applyRuntimeState -> authPassed forced YES (was %d)", authPassed);
     if (applyRuntimeState_original) {
         applyRuntimeState_original(self, _cmd, envReady, hudRunning, canExploit, YES);
     }
 }
 
-// --- 6. presentViewController -> 拦截卡密弹窗 ---
-// 等价于 Frida: Interceptor.attach(impl, { onEnter: function(args){
-//   if (clsName === "UIAlertController") { if (title contains keywords) { args[4]=ptr(NULL); } }
-// }})
+// --- presentViewController -> 拦截卡密弹窗 ---
 static void (*presentVC_original)(id, SEL, id, BOOL, id) = NULL;
 static void presentVC_hook(id self, SEL _cmd, id presentedVC, BOOL animated, id completion) {
-    // 检查是否是 UIAlertController
     Class presentedClass = object_getClass(presentedVC);
     Class alertClass = objc_getClass("UIAlertController");
     if (presentedClass == alertClass) {
-        // 获取 title
         NSString *title = @"";
         @try { title = [(UIViewController *)presentedVC title] ?: @""; } @catch(id e) {}
 
-        // 检查关键词（心悦、验证、激活、卡密、失败、不存在、输入）
         BOOL shouldBlock = NO;
         NSArray *keywords = @[@"心悦", @"验证", @"激活", @"卡密", @"失败", @"不存在", @"输入"];
         for (NSString *kw in keywords) {
@@ -223,29 +209,21 @@ static void presentVC_hook(id self, SEL _cmd, id presentedVC, BOOL animated, id 
         }
 
         if (shouldBlock) {
-            NSLog(@"[xinyue] BLOCKING presentation of: %@", title);
-            // 等价于 args[4]=ptr(NULL)：把 completion handler 设为 NULL
+            NSLog(@"[xinyue] BLOCKING alert: %@", title);
             presentVC_original(self, _cmd, presentedVC, animated, NULL);
             return;
         }
-        NSLog(@"[xinyue] presenting alert (pass-through): %@", title);
+        NSLog(@"[xinyue] alert pass-through: %@", title);
     }
 
-    // 正常调用
     presentVC_original(self, _cmd, presentedVC, animated, completion);
 }
 
-// --- 7. viewDidAppear -> 自动关闭卡密弹窗 ---
-// 等价于 Frida: Interceptor.attach(impl, { onEnter: function(args){
-//   if (clsName === "UIAlertController" && title contains keywords) {
-//     dispatch_async(main_queue, ^{ [self dismissViewControllerAnimated:YES completion:NULL]; });
-//   }
-// }})
+// --- viewDidAppear -> 自动关闭卡密弹窗 ---
 static void (*viewDidAppear_original)(id, SEL, BOOL) = NULL;
 static void viewDidAppear_hook(id self, SEL _cmd, BOOL animated) {
     viewDidAppear_original(self, _cmd, animated);
 
-    // 检查是否是 UIAlertController
     Class selfClass = object_getClass(self);
     Class alertClass = objc_getClass("UIAlertController");
     if (selfClass == alertClass) {
@@ -268,27 +246,24 @@ static void viewDidAppear_hook(id self, SEL _cmd, BOOL animated) {
 }
 
 // ============================================================================
-// 安装 ObjC hooks
+// 安装 ObjC hooks（在 +load 中调用，确保所有类已注册）
 // ============================================================================
 
 static void install_objc_hooks(void) {
     NSLog(@"[xinyue] === installing ObjC hooks ===");
 
-    // --- ViewController hooks ---
     Class vcClass = objc_getClass("ViewController");
     if (vcClass) {
-        NSLog(@"[xinyue] ViewController found");
+        NSLog(@"[xinyue] ViewController found: %p", vcClass);
 
         // showLaunchScreen -> no-op
         Method showMethod = class_getInstanceMethod(vcClass, NSSelectorFromString(@"showLaunchScreen"));
         if (showMethod) {
-            // 等价于 Interceptor.replace
             method_setImplementation(showMethod, (IMP)showLaunchScreen_replacement);
-            NSLog(@"[xinyue] showLaunchScreen replaced no-op");
+            NSLog(@"[xinyue] showLaunchScreen -> no-op OK");
+        } else {
+            NSLog(@"[xinyue] showLaunchScreen method not found");
         }
-
-        // hideLaunchScreen -> pass-through (just log, no change needed)
-        // JS 脚本只是 attach 记日志，不改行为，所以我们也不改
 
         // applyRuntimeState -> force authPassed=YES
         Method applyMethod = class_getInstanceMethod(vcClass,
@@ -297,87 +272,111 @@ static void install_objc_hooks(void) {
             IMP origImpl = method_getImplementation(applyMethod);
             applyRuntimeState_original = (void (*)(id, SEL, BOOL, BOOL, BOOL, BOOL))origImpl;
             method_setImplementation(applyMethod, (IMP)applyRuntimeState_hook);
-            NSLog(@"[xinyue] applyRuntimeState hooked (force authPassed=YES)");
+            NSLog(@"[xinyue] applyRuntimeState -> force authPassed=YES OK");
+        } else {
+            NSLog(@"[xinyue] applyRuntimeState method not found");
         }
-
-        // pollActivationThenReveal, refreshAuthSummary, hideLaunchScreen
-        // JS 脚本只是 attach 记日志，不改行为，不翻译
     } else {
-        NSLog(@"[xinyue] WARNING: ViewController class not found");
+        NSLog(@"[xinyue] WARNING: ViewController class not found!");
     }
 
-    // --- UIViewController hooks (presentViewController, viewDidAppear) ---
+    // UIViewController hooks
     Class uiVCClass = objc_getClass("UIViewController");
     if (uiVCClass) {
-        // presentViewController:animated:completion: -> 拦截卡密弹窗
         Method presentMethod = class_getInstanceMethod(uiVCClass,
             NSSelectorFromString(@"presentViewController:animated:completion:"));
         if (presentMethod) {
             IMP origImpl = method_getImplementation(presentMethod);
             presentVC_original = (void (*)(id, SEL, id, BOOL, id))origImpl;
             method_setImplementation(presentMethod, (IMP)presentVC_hook);
-            NSLog(@"[xinyue] presentViewController hook installed");
+            NSLog(@"[xinyue] presentViewController hook OK");
         }
 
-        // viewDidAppear: -> 自动关闭卡密弹窗
         Method viewDidMethod = class_getInstanceMethod(uiVCClass,
             NSSelectorFromString(@"viewDidAppear:"));
         if (viewDidMethod) {
             IMP origImpl = method_getImplementation(viewDidMethod);
             viewDidAppear_original = (void (*)(id, SEL, BOOL))origImpl;
             method_setImplementation(viewDidMethod, (IMP)viewDidAppear_hook);
-            NSLog(@"[xinyue] viewDidAppear hook for auto-dismiss");
+            NSLog(@"[xinyue] viewDidAppear hook OK");
         }
     }
 
-    // --- UIAlertController init hook (just log, no behavior change) ---
-    // JS 脚本只是 attach 记日志，不翻译
-
-    NSLog(@"[xinyue] === ObjC hooks installed ===");
+    NSLog(@"[xinyue] === ObjC hooks done ===");
 }
 
 // ============================================================================
-// 主函数：应用所有 patch 和 hook
+// C 函数 patch（在 constructor 中执行）
 // ============================================================================
 
-static void apply_all_patches(void) {
-    NSLog(@"[xinyue] === XINYUE crack v6 (complete translation) ===");
+static void apply_c_patches(void) {
+    NSLog(@"[xinyue] === applying C function patches ===");
 
     uintptr_t base = get_xyld_base();
     if (base == 0) {
-        NSLog(@"[xinyue] ERROR: xyld base not found!");
+        NSLog(@"[xinyue] FATAL: xyld base not found! Cannot patch.");
         return;
     }
-    NSLog(@"[xinyue] xyld base: 0x%lx", (unsigned long)base);
+    NSLog(@"[xinyue] xyld base = 0x%lx", (unsigned long)base);
 
-    // 假日期字符串已用 CFSTR 常量初始化，无需额外操作
+    // 1. _LFVerifyNetworkActivation -> return 1
+    // 先尝试 dlsym，失败用 base+0x4870
+    uintptr_t addr = resolve_export("LFVerifyNetworkActivation");
+    if (addr) {
+        NSLog(@"[xinyue] LFVerifyNetworkActivation via dlsym = 0x%lx", (unsigned long)addr);
+    } else {
+        addr = base + 0x4870;
+        NSLog(@"[xinyue] LFVerifyNetworkActivation via offset = 0x%lx", (unsigned long)addr);
+    }
+    patch_return_one(addr, "LFVerifyNetworkActivation");
 
-    // ========== 1. C 函数 patch: sub_F14144v -> return 1 ==========
-    patch_return_one(base + 0x5cacac, "sub_F14144v");
+    // 2. sub_F14144v -> return 1
+    addr = resolve_export("_Z10sub_F14144v");
+    if (addr) {
+        NSLog(@"[xinyue] sub_F14144v via dlsym = 0x%lx", (unsigned long)addr);
+    } else {
+        addr = base + 0x5cacac;
+        NSLog(@"[xinyue] sub_F14144v via offset = 0x%lx", (unsigned long)addr);
+    }
+    patch_return_one(addr, "sub_F14144v");
 
-    // ========== 2. C 函数 patch: _LFVerifyNetworkActivation -> return 1 ==========
-    patch_return_one(base + 0x4870, "LFVerifyNetworkActivation");
+    // 3. LFVerifierExpiryText -> 返回假日期
+    addr = resolve_export("_ZL20LFVerifierExpiryTextv");
+    if (addr) {
+        NSLog(@"[xinyue] LFVerifierExpiryText via dlsym = 0x%lx", (unsigned long)addr);
+    } else {
+        addr = base + 0x10f00;
+        NSLog(@"[xinyue] LFVerifierExpiryText via offset = 0x%lx", (unsigned long)addr);
+    }
+    patch_expiry_text(addr, "LFVerifierExpiryText");
 
-    // ========== 3. C 函数 patch: LFVerifierExpiryText -> 返回假日期 ==========
-    // JS 脚本用 Interceptor.attach onLeave 修改返回值
-    // 这里用 B 指令跳转到我们的替代函数
-    patch_expiry_text(base + 0x10f00, "LFVerifierExpiryText");
+    // 4. sub_65D614v -> 跳过弹窗构建
+    patch_skip_dialog(base, 0x58be8, "sub_65D614v");
 
-    // ========== 4. C 函数 patch: sub_65D614v -> 跳过弹窗构建 ==========
-    patch_skip_dialog(base, 0x58be8, "sub_65D614v skip dialog");
-
-    // ========== 5. ObjC hooks ==========
-    install_objc_hooks();
-
-    NSLog(@"[xinyue] === all patches and hooks applied ===");
+    NSLog(@"[xinyue] === C patches done ===");
 }
 
 // ============================================================================
-// Constructor: 在进程启动时直接同步执行
+// Constructor: C 函数 patch（时机最早，在 main() 之前）
 // ============================================================================
 __attribute__((constructor))
-static void xinyue_crack_init(void) {
-    // 直接同步执行，不用 dispatch_async
-    // constructor 执行时机比 main() 和 +load 都早
-    apply_all_patches();
+static void xinyue_crack_ctor(void) {
+    NSLog(@"[xinyue] === dylib constructor executed ===");
+    apply_c_patches();
 }
+
+// ============================================================================
+// +load: ObjC hooks（时机比 constructor 晚，但确保所有类已注册）
+// ============================================================================
+@interface XinyueCrackLoader : NSObject
+@end
+@implementation XinyueCrackLoader
++ (void)load {
+    NSLog(@"[xinyue] === XinyueCrackLoader +load ===");
+    // ObjC 类在这个时机已经全部注册完成
+    // 用 dispatch_async 到 main queue 确保 +load 全部执行完毕
+    dispatch_async(dispatch_get_main_queue(), ^{
+        install_objc_hooks();
+    });
+}
+@end
