@@ -149,7 +149,8 @@ static void hook_presentViewController(id self, SEL _cmd,
             // 直接阻止，不调用原方法
             // 调用 completion 表示已完成（避免 App 等待）
             if (completion) {
-                ((void(*)(id))completion)(NULL);
+                void (^block)(void) = (void(^)(void))completion;
+                block();
             }
             return;
         }
