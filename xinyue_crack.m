@@ -141,10 +141,10 @@ static IMP g_orig_applyRuntimeState = NULL;
 
 // ========== Hook 函数实现 ==========
 
-// showLaunchScreen → no-op
-static void hook_showLaunchScreen(id self, SEL _cmd) {
-    NSLog(@"[xinyue] showLaunchScreen BLOCKED");
-}
+// showLaunchScreen → 不 hook，让它正常执行
+// Frida JS 中 replace 成 no-op 是为了阻止重启时再次显示启动屏
+// 但 dylib 注入时 App 刚启动，showLaunchScreen 需要正常执行
+// 否则启动屏永远不会消失，卡在加载界面
 
 // applyRuntimeState → 强制 authPassed=YES
 static void hook_applyRuntimeState(id self, SEL _cmd,
@@ -223,11 +223,7 @@ static void install_objc_hooks(void) {
     if (vcClass) {
         NSLog(@"[xinyue] ViewController found");
 
-        // showLaunchScreen → no-op
-        safe_swizzle(vcClass,
-                     NSSelectorFromString(@"showLaunchScreen"),
-                     (IMP)hook_showLaunchScreen, NULL);
-
+        // showLaunchScreen → 不 hook，让它正常执行（避免卡在加载界面）
         // applyRuntimeState → authPassed=YES
         safe_swizzle(vcClass,
                      NSSelectorFromString(@"applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:"),
