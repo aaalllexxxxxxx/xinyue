@@ -22,12 +22,93 @@ jobs:
         echo "SOURCE_FILE=$SRC" >> $GITHUB_ENV
         echo "Found source: $SRC"
 
+    - name: Find JS and config
+      run: |
+        JS=$(find . -name "FridaGadget.js" | head -1)
+        CFG=$(find . -name "FridaGadget.config" | head -1)
+        if [ -z "$JS" ] || [ -z "$CFG" ]; then
+          echo "ERROR: FridaGadget.js or FridaGadget.config not found!"
+          exit 1
+        fi
+        echo "JS_FILE=$JS" >> $GITHUB_ENV
+        echo "CONFIG_FILE=$CFG" >> $GITHUB_ENV
+        echo "Found JS: $JS"
+        echo "Found config: $CFG"
+
+    - name: Download and prepare Frida Gadget
+      run: |
+        set -e
+        # Query GitHub API for latest frida release
+        echo "Downloading frida-gadget..."
+        # Try to get the latest release tag
+        LATEST=$(curl -sL https://api.github.com/repos/frida/frida/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "16.7.0")
+        echo "Frida version: $LATEST"
+
+        # Download frida-gadget for iOS arm64
+        URL="https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-arm64.dylib.gz"
+        echo "Downloading from: $URL"
+        curl -sL -o frida-gadget.dylib.gz "$URL"
+
+        # Check if we got a valid file
+        if [ ! -s frida-gadget.dylib.gz ]; then
+          echo "Download failed, trying universal..."
+          URL="https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-universal.dylib.gz"
+          curl -sL -o frida-gadget.dylib.gz "$URL"
+        fi
+
+        # Decompress
+        gunzip -f frida-gadget.dylib.gz || true
+        if [ ! -s frida-gadget.dylib ]; then
+          # Maybe it was already decompressed or xz format
+          echo "Trying xz format..."
+          curl -sL -o frida-gadget.dylib.xz "https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-arm64.dylib.xz"
+          xz -d frida-gadget.dylib.xz || true
+        fi
+
+        ls -lh frida-gadget.dylib
+        file frida-gadget.dylib
+
+    - name: Generate C headers from binary data
+      run: |
+        python3 << 'PYEOF'
+        import os
+
+        def generate_header(input_path, output_path, var_name, size_var):
+            with open(input_path, 'rb') as f:
+                data = f.read()
+            with open(output_path, 'w') as out:
+                out.write(f'// Auto-generated from {os.path.basename(input_path)}\n')
+                out.write(f'#pragma once\n')
+                out.write(f'const unsigned char {var_name}[] = {{\n')
+                for i in range(0, len(data), 16):
+                    chunk = data[i:i+16]
+                    hex_vals = ', '.join(f'0x{b:02x}' for b in chunk)
+                    out.write(f'  {hex_vals},\n')
+                out.write(f'}};\n')
+                out.write(f'const unsigned long {size_var} = sizeof({var_name});\n')
+            print(f'Generated {output_path}: {len(data)} bytes')
+
+        generate_header('frida-gadget.dylib', 'frida_gadget_data.h', 'frida_gadget_data', 'frida_gadget_size')
+        generate_header(os.environ.get('JS_FILE', 'FridaGadget.js'), 'frida_js_data.h', 'frida_js_data', 'frida_js_size')
+        generate_header(os.environ.get('CONFIG_FILE', 'FridaGadget.config'), 'frida_config_data.h', 'frida_config_data', 'frida_config_size')
+        PYEOF
+
+    - name: Sign frida-gadget
+      run: |
+        if command -v ldid &> /dev/null; then
+          ldid -S frida-gadget.dylib
+          echo "Signed frida-gadget with ldid"
+        else
+          codesign -f -s - frida-gadget.dylib 2>/dev/null || true
+          echo "Signed frida-gadget with codesign"
+        fi
+
     - name: Get SDK path
       run: |
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
         echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
 
-    - name: Compile dylib (arm64)
+    - name: Compile wrapper dylib
       run: |
         set -e
 
@@ -36,10 +117,10 @@ jobs:
           -isysroot "$SDK_PATH" \
           -dynamiclib \
           -framework Foundation \
-          -framework UIKit \
           -fobjc-arc \
           -Wall -Wno-deprecated-declarations \
           -miphoneos-version-min=14.0 \
+          -I. \
           -install_name @rpath/xinyue_crack.dylib \
           -o xinyue_crack.dylib \
           "$SOURCE_FILE"
@@ -48,7 +129,7 @@ jobs:
         file xinyue_crack.dylib
         ls -lh xinyue_crack.dylib
 
-    - name: Sign dylib
+    - name: Sign wrapper dylib
       run: |
         if command -v ldid &> /dev/null; then
           ldid -S xinyue_crack.dylib
