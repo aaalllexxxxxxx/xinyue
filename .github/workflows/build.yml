@@ -38,33 +38,30 @@ jobs:
     - name: Download and prepare Frida Gadget
       run: |
         set -e
-        # Query GitHub API for latest frida release
-        echo "Downloading frida-gadget..."
-        # Try to get the latest release tag
-        LATEST=$(curl -sL https://api.github.com/repos/frida/frida/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "16.7.0")
-        echo "Frida version: $LATEST"
+        # Frida 17.x removed iOS gadget, last version with iOS gadget is 16.6.3
+        # File name format: frida-gadget-VERSION-ios-universal.dylib.gz
+        FRIDA_VERSION="16.6.3"
+        echo "Using frida-gadget version: $FRIDA_VERSION"
 
-        # Download frida-gadget for iOS arm64
-        URL="https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-arm64.dylib.gz"
+        URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-ios-universal.dylib.gz"
         echo "Downloading from: $URL"
         curl -sL -o frida-gadget.dylib.gz "$URL"
 
-        # Check if we got a valid file
+        # Verify download
         if [ ! -s frida-gadget.dylib.gz ]; then
-          echo "Download failed, trying universal..."
-          URL="https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-universal.dylib.gz"
-          curl -sL -o frida-gadget.dylib.gz "$URL"
+          echo "ERROR: Download failed!"
+          exit 1
         fi
 
         # Decompress
-        gunzip -f frida-gadget.dylib.gz || true
+        gunzip -f frida-gadget.dylib.gz
+
         if [ ! -s frida-gadget.dylib ]; then
-          # Maybe it was already decompressed or xz format
-          echo "Trying xz format..."
-          curl -sL -o frida-gadget.dylib.xz "https://github.com/frida/frida/releases/download/${LATEST}/frida-gadget-${LATEST}-ios-arm64.dylib.xz"
-          xz -d frida-gadget.dylib.xz || true
+          echo "ERROR: Decompression failed!"
+          exit 1
         fi
 
+        echo "=== Downloaded frida-gadget ==="
         ls -lh frida-gadget.dylib
         file frida-gadget.dylib
 
