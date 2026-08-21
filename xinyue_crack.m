@@ -116,10 +116,10 @@ static IMP g_orig_present = NULL;
 static IMP g_orig_viewDidAppear = NULL;
 static IMP g_orig_applyRuntimeState = NULL;
 
-// ========== Hook: showLaunchScreen → no-op（和 Frida Interceptor.replace 一致） ==========
-static void hook_showLaunchScreen(id self, SEL _cmd) {
-    NSLog(@"[xinyue] showLaunchScreen BLOCKED");
-}
+// showLaunchScreen → 不 hook，让它正常执行
+// Frida 在 App 已运行后注入，replace no-op 是为了阻止重启时再次显示
+// dylib 在 App 启动时注入，showLaunchScreen 必须正常执行
+// 否则启动屏状态机卡住，第一次进入卡在加载页面
 
 // ========== Hook: applyRuntimeState → 强制 authPassed=YES ==========
 static void hook_applyRuntimeState(id self, SEL _cmd,
@@ -131,10 +131,9 @@ static void hook_applyRuntimeState(id self, SEL _cmd,
     }
 }
 
-// ========== Hook: presentViewController → 不阻止调用，只设 completion=NULL ==========
-// Frida JS 用 Interceptor.attach，onEnter 里设 args[4]=ptr(NULL)
-// 不阻止 present，只清空 completion handler
-// 然后靠 viewDidAppear hook 自动 dismiss
+// ========== Hook: presentViewController → 直接阻止卡密弹窗 ==========
+// 优化：直接 return 不 present，弹窗根本不会出现
+// 比 Frida 的 "present 后再 dismiss" 更干净，无闪烁
 static void hook_presentViewController(id self, SEL _cmd,
     id viewController, BOOL animated, id completion) {
 
@@ -146,13 +145,17 @@ static void hook_presentViewController(id self, SEL _cmd,
         @try { title = [viewController valueForKey:@"title"]; } @catch(id e) {}
 
         if (has_cdkey_keyword(title)) {
-            NSLog(@"[xinyue] presentViewController: setting completion=NULL for %@", title);
-            // 和 Frida 一致：不阻止 present，只把 completion 设为 NULL
-            completion = NULL;
+            NSLog(@"[xinyue] BLOCKING UIAlertController: %@", title);
+            // 直接阻止，不调用原方法
+            // 调用 completion 表示已完成（避免 App 等待）
+            if (completion) {
+                ((void(*)(id))completion)(NULL);
+            }
+            return;
         }
     }
 
-    // 调用原始方法（不阻止！）
+    // 非卡密弹窗，正常调用
     if (g_orig_present) {
         ((void(*)(id, SEL, id, BOOL, id))g_orig_present)(
             self, _cmd, viewController, animated, completion);
@@ -200,11 +203,7 @@ static void install_all_objc_hooks(void) {
     if (vcClass) {
         NSLog(@"[xinyue] ViewController found");
 
-        // showLaunchScreen → no-op（和 Frida Interceptor.replace 一致）
-        safe_swizzle(vcClass,
-                     NSSelectorFromString(@"showLaunchScreen"),
-                     (IMP)hook_showLaunchScreen, NULL);
-
+        // showLaunchScreen → 不 hook（让它正常执行，避免卡在加载页面）
         // applyRuntimeState → authPassed=YES
         safe_swizzle(vcClass,
                      NSSelectorFromString(@"applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:"),
