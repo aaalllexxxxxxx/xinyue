@@ -65,6 +65,20 @@ jobs:
         ls -lh frida-gadget.dylib
         file frida-gadget.dylib
 
+        # Extract arm64 thin slice from universal dylib
+        echo "=== Extracting arm64 slice ==="
+        lipo frida-gadget.dylib -thin arm64 -output frida-gadget-arm64.dylib || cp frida-gadget.dylib frida-gadget-arm64.dylib
+        mv frida-gadget-arm64.dylib frida-gadget.dylib
+        ls -lh frida-gadget.dylib
+        file frida-gadget.dylib
+
+    - name: Verify frida-gadget architecture
+      run: |
+        echo "=== Verifying frida-gadget ==="
+        file frida-gadget.dylib
+        otool -hv frida-gadget.dylib | head -5
+        otool -L frida-gadget.dylib | head -10
+
     - name: Generate C headers from binary data
       run: |
         python3 << 'PYEOF'
