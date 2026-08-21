@@ -3,19 +3,21 @@
 // 纯 ObjC 实现 hook_activation.js v6 的全部逻辑，不依赖 Frida
 // 注入后永久绕过心悦漏打卡密验证
 //
-// 原理：
-// 1. C 函数内存 patch（vm_protect + memcpy + sys_icache_invalidate）
-//    - sub_F14144v @ 0x5cacac → MOV W0,#1; RET（验证子函数始终返回1）
-//    - _LFVerifyNetworkActivation @ 0x4870 → MOV W0,#1; RET（网络验证始终返回1）
-//    - sub_65D614v @ 0x58be8+0x08 → B 跳过弹窗构建，保留 tail-call
-// 2. ObjC method swizzle（method_setImplementation 保存原始 IMP）
-//    - ViewController.showLaunchScreen → no-op（阻止启动屏）
-//    - ViewController.applyRuntimeState... → 强制 authPassed=1
-//    - UIViewController.presentViewController → 拦截卡密弹窗
-//    - UIViewController.viewDidAppear → 自动 dismiss 卡密弹窗
+// 关键设计：
+// - C 函数 patch 在 constructor 中同步执行（不延迟！）
+//   Frida spawn 模式在 App 第一条指令前就 hook 了
+//   dylib constructor 也在 main() 之前执行，但必须同步 patch
+//   否则 dispatch_async 延迟到 main runloop 时验证已经跑完了
+// - ObjC hooks 用 dispatch_async 延迟到 main queue
+//   因为 constructor 时 ViewController 类可能还没加载
 //
-// 关键：所有 hook 延迟到 dispatch_async(main_queue) 执行，
-// 确保所有模块和类已加载完成，避免 constructor 中过早 hook 导致闪退
+// Patch 点（来自 hook_activation.js v6）：
+// 1. sub_F14144v @ 0x5cacac → MOV W0,#1; RET
+// 2. _LFVerifyNetworkActivation @ 0x4870 → MOV W0,#1; RET
+// 3. sub_65D614v @ 0x58be8+0x08 → B 跳过弹窗，保留 tail-call
+// 4. ViewController.applyRuntimeState... → 强制 authPassed=YES
+// 5. UIViewController.presentViewController → 拦截卡密弹窗
+// 6. UIViewController.viewDidAppear → 自动 dismiss 卡密弹窗
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -141,20 +143,15 @@ static IMP g_orig_applyRuntimeState = NULL;
 
 // ========== Hook 函数实现 ==========
 
-// showLaunchScreen → 不 hook，让它正常执行
-// Frida JS 中 replace 成 no-op 是为了阻止重启时再次显示启动屏
-// 但 dylib 注入时 App 刚启动，showLaunchScreen 需要正常执行
-// 否则启动屏永远不会消失，卡在加载界面
-
 // applyRuntimeState → 强制 authPassed=YES
 static void hook_applyRuntimeState(id self, SEL _cmd,
     BOOL envReady, BOOL hudRunning, BOOL canExploit, BOOL authPassed) {
 
+    NSLog(@"[xinyue] applyRuntimeState called, forcing authPassed=YES");
     if (g_orig_applyRuntimeState) {
         ((void(*)(id, SEL, BOOL, BOOL, BOOL, BOOL))g_orig_applyRuntimeState)(
             self, _cmd, envReady, hudRunning, canExploit, YES);
     }
-    NSLog(@"[xinyue] applyRuntimeState → authPassed forced to YES");
 }
 
 // presentViewController → 拦截卡密弹窗
@@ -200,16 +197,14 @@ static void hook_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     }
 }
 
-// ========== 安全 swizzle：保存原始 IMP 后替换 ==========
+// ========== 安全 swizzle ==========
 static void safe_swizzle(Class cls, SEL sel, IMP newImp, IMP *origImpPtr) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) {
         NSLog(@"[xinyue] Method not found: %@", NSStringFromSelector(sel));
         return;
     }
-    // 保存原始 IMP
     if (origImpPtr) *origImpPtr = method_getImplementation(m);
-    // 替换
     method_setImplementation(m, newImp);
     NSLog(@"[xinyue] Swizzled: %@", NSStringFromSelector(sel));
 }
@@ -218,13 +213,11 @@ static void safe_swizzle(Class cls, SEL sel, IMP newImp, IMP *origImpPtr) {
 static void install_objc_hooks(void) {
     NSLog(@"[xinyue] Installing ObjC hooks...");
 
-    // 1. ViewController hooks
+    // ViewController hooks
     Class vcClass = objc_getClass("ViewController");
     if (vcClass) {
         NSLog(@"[xinyue] ViewController found");
 
-        // showLaunchScreen → 不 hook，让它正常执行（避免卡在加载界面）
-        // applyRuntimeState → authPassed=YES
         safe_swizzle(vcClass,
                      NSSelectorFromString(@"applyRuntimeStateWithEnvironmentReady:hudRunning:canExploitLocally:authPassed:"),
                      (IMP)hook_applyRuntimeState, &g_orig_applyRuntimeState);
@@ -232,15 +225,11 @@ static void install_objc_hooks(void) {
         NSLog(@"[xinyue] ViewController not found");
     }
 
-    // 2. UIViewController hooks（全局生效）
+    // UIViewController hooks（全局）
     Class uivcClass = [UIViewController class];
-
-    // presentViewController → 拦截卡密弹窗
     safe_swizzle(uivcClass,
                  @selector(presentViewController:animated:completion:),
                  (IMP)hook_presentViewController, &g_orig_present);
-
-    // viewDidAppear → 自动 dismiss
     safe_swizzle(uivcClass,
                  @selector(viewDidAppear:),
                  (IMP)hook_viewDidAppear, &g_orig_viewDidAppear);
@@ -252,7 +241,6 @@ static void install_objc_hooks(void) {
 static void try_install_vc_hooks(int attempt) {
     if (attempt > 30) {
         NSLog(@"[xinyue] ViewController hook: gave up after 30 attempts");
-        // 即使 ViewController 没找到，UIViewController hooks 仍然已安装
         return;
     }
 
@@ -261,7 +249,7 @@ static void try_install_vc_hooks(int attempt) {
         install_objc_hooks();
     } else {
         if (attempt == 1) {
-            // 第一次先安装 UIViewController 级别的 hooks（不依赖 ViewController 类）
+            // 先装 UIViewController 级别 hooks
             Class uivcClass = [UIViewController class];
             safe_swizzle(uivcClass,
                          @selector(presentViewController:animated:completion:),
@@ -281,25 +269,36 @@ static void try_install_vc_hooks(int attempt) {
 // ========== 主入口 ==========
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
-    NSLog(@"[xinyue] === crack dylib init (pure ObjC, no Frida) ===");
+    NSLog(@"[xinyue] === crack dylib init ===");
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // ===== C 函数 patch：同步执行，不延迟！ =====
+    // Frida spawn 模式在 App 第一条指令前就 hook 了
+    // constructor 在 main() 之前执行，但必须同步 patch
+    // 否则 dispatch_async 延迟到 main runloop 时验证已经跑完了
+    uintptr_t base = get_main_module_base();
+    if (base == 0) {
+        NSLog(@"[xinyue] FATAL: cannot find main module base, deferring to main queue");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            uintptr_t b = get_main_module_base();
+            if (b) {
+                patch_return_one(b, OFFSET_SUB_F14144V, "sub_F14144v");
+                patch_return_one(b, OFFSET_LFVERIFY_NET_ACT, "LFVerifyNetworkActivation");
+                patch_skip_dialog(b, OFFSET_SUB_65D614V, "sub_65D614v (CDKey dialog)");
+            }
+            try_install_vc_hooks(1);
+        });
+    } else {
+        NSLog(@"[xinyue] main module base: 0x%lx", base);
 
-        // ===== C 函数 patch =====
-        uintptr_t base = get_main_module_base();
-        if (base == 0) {
-            NSLog(@"[xinyue] FATAL: cannot find main module base");
-        } else {
-            NSLog(@"[xinyue] main module base: 0x%lx", base);
+        patch_return_one(base, OFFSET_SUB_F14144V, "sub_F14144v");
+        patch_return_one(base, OFFSET_LFVERIFY_NET_ACT, "LFVerifyNetworkActivation");
+        patch_skip_dialog(base, OFFSET_SUB_65D614V, "sub_65D614v (CDKey dialog)");
 
-            patch_return_one(base, OFFSET_SUB_F14144V, "sub_F14144v");
-            patch_return_one(base, OFFSET_LFVERIFY_NET_ACT, "LFVerifyNetworkActivation");
-            patch_skip_dialog(base, OFFSET_SUB_65D614V, "sub_65D614v (CDKey dialog)");
-        }
+        // ===== ObjC hooks：延迟到 main queue =====
+        dispatch_async(dispatch_get_main_queue(), ^{
+            try_install_vc_hooks(1);
+        });
+    }
 
-        // ===== ObjC hooks =====
-        try_install_vc_hooks(1);
-    });
-
-    NSLog(@"[xinyue] === crack dylib scheduled ===");
+    NSLog(@"[xinyue] === crack dylib done ===");
 }
