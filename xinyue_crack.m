@@ -1,20 +1,22 @@
-// xinyue_crack.dylib - Frida Gadget 内嵌方案
+// xinyue_crack.dylib - Frida Gadget 方案
 //
 // 把 frida-gadget.dylib + FridaGadget.js + FridaGadget.config 嵌入数据段
-// constructor 中释放到沙盒目录，用 ldid 重签名后 dlopen 加载
-// frida-gadget 会自动读取同目录的 .config 和 .js 执行 hook 脚本
+// constructor 中释放到 wrapper dylib 所在目录（TweakInject），然后 dlopen
+// TweakInject 目录的签名验证和 xinyue_crack.dylib 一样（ad-hoc 签名通过）
+//
+// 关键修复：之前释放到沙盒 Library/Caches 目录，dlopen 因签名验证失败
+// 现在释放到 wrapper dylib 自己所在目录（TweakInject），签名验证和自身一样
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <sys/stat.h>
-#import <spawn.h>
 
 // 嵌入的二进制数据（由 build.yml 中的 Python 脚本生成）
 #include "frida_gadget_data.h"
 #include "frida_js_data.h"
 #include "frida_config_data.h"
 
-// 释放嵌入数据到文件
 static bool write_to_file(const char *path, const unsigned char *data, unsigned long size) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
@@ -31,51 +33,50 @@ static bool write_to_file(const char *path, const unsigned char *data, unsigned 
     return true;
 }
 
-// 用 ldid 重签名 dylib（越狱环境）
-static void resign_dylib(const char *path) {
-    // 尝试用 ldid -S 重签名
-    pid_t pid;
-    char *argv[] = {"ldid", "-S", (char *)path, NULL};
-    extern char **environ;
-    int status;
-    int err = posix_spawn(&pid, "/usr/bin/ldid", NULL, NULL, argv, environ);
-    if (err != 0) {
-        // ldid 可能不在 /usr/bin，尝试 PATH 查找
-        err = posix_spawnp(&pid, "ldid", NULL, NULL, argv, environ);
+// 获取 wrapper dylib 自身所在目录
+static void get_dylib_dir(char *buf, size_t bufsize) {
+    // 方法1: 用 dladdr 获取当前函数地址对应的模块路径
+    Dl_info info;
+    if (dladdr((void *)get_dylib_dir, &info) && info.dli_fname) {
+        strncpy(buf, info.dli_fname, bufsize - 1);
+        buf[bufsize - 1] = '\0';
+        // 去掉文件名，只留目录
+        char *lastSlash = strrchr(buf, '/');
+        if (lastSlash) {
+            *lastSlash = '\0';
+        }
+        return;
     }
-    if (err == 0) {
-        waitpid(pid, &status, 0);
-        NSLog(@"[xinyue] ldid resign status=%d", status);
-    } else {
-        NSLog(@"[xinyue] ldid not found (%d), trying codesign", err);
-        // 尝试 codesign
-        char *argv2[] = {"codesign", "-f", "-s", "-", (char *)path, NULL};
-        err = posix_spawnp(&pid, "codesign", NULL, NULL, argv2, environ);
-        if (err == 0) {
-            waitpid(pid, &status, 0);
-            NSLog(@"[xinyue] codesign resign status=%d", status);
-        } else {
-            NSLog(@"[xinyue] codesign also not found (%d)", err);
+
+    // 方法2: 遍历已加载模块，找 xinyue_crack
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "xinyue_crack")) {
+            strncpy(buf, name, bufsize - 1);
+            buf[bufsize - 1] = '\0';
+            char *lastSlash = strrchr(buf, '/');
+            if (lastSlash) *lastSlash = '\0';
+            return;
         }
     }
-    // 设置可执行权限
-    chmod(path, 0755);
+
+    // Fallback: 沙盒 Caches 目录
+    NSString *cachesDir = NSSearchPathForDirectoriesInDomains(
+        NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (cachesDir) {
+        strncpy(buf, [cachesDir UTF8String], bufsize - 1);
+        buf[bufsize - 1] = '\0';
+    }
 }
 
 __attribute__((constructor))
 static void xinyue_crack_init(void) {
-    NSLog(@"[xinyue] === crack dylib loading (frida-gadget embedded) ===");
+    NSLog(@"[xinyue] === crack dylib init (frida-gadget embedded) ===");
 
-    // 获取沙盒 Library/Caches 目录
-    NSString *cachesDir = NSSearchPathForDirectoriesInDomains(
-        NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    if (!cachesDir) {
-        NSLog(@"[xinyue] FATAL: cannot get caches directory");
-        return;
-    }
-
-    const char *dir = [cachesDir UTF8String];
-    NSLog(@"[xinyue] sandbox dir: %s", dir);
+    // 获取 wrapper dylib 自身所在目录
+    char dir[1024];
+    get_dylib_dir(dir, sizeof(dir));
+    NSLog(@"[xinyue] dylib dir: %s", dir);
 
     // 释放 frida-gadget.dylib
     char gadgetPath[1024];
@@ -101,25 +102,21 @@ static void xinyue_crack_init(void) {
         return;
     }
 
-    // 重签名 frida-gadget（释放后签名可能失效）
-    NSLog(@"[xinyue] resigning FridaGadget.dylib...");
-    resign_dylib(gadgetPath);
-
-    // 清除 dlerror
-    dlerror();
-
     // dlopen 加载 frida-gadget
+    // FridaGadget.dylib 释放到 TweakInject 目录（和 xinyue_crack.dylib 同目录）
+    // 这个目录的签名验证和 xinyue_crack.dylib 一样，ad-hoc 签名应该能通过
+    dlerror(); // clear
     NSLog(@"[xinyue] dlopen(%s)...", gadgetPath);
     void *handle = dlopen(gadgetPath, RTLD_NOW);
     if (!handle) {
         char *err = dlerror();
         NSLog(@"[xinyue] dlopen FAILED: %s", err ? err : "(unknown)");
 
-        // 尝试用 RTLD_LAZY
+        // 尝试 RTLD_LAZY
         dlerror();
         handle = dlopen(gadgetPath, RTLD_LAZY);
         if (handle) {
-            NSLog(@"[xinyue] dlopen OK with RTLD_LAZY!");
+            NSLog(@"[xinyue] dlopen OK with RTLD_LAZY");
         } else {
             err = dlerror();
             NSLog(@"[xinyue] dlopen RTLD_LAZY also FAILED: %s", err ? err : "(unknown)");
