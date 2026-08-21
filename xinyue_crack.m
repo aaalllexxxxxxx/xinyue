@@ -25,6 +25,7 @@
 #import <mach-o/dyld.h>
 #import <mach/vm_map.h>
 #import <mach/mach_init.h>
+#include <libkern/OSCacheControl.h>
 
 // ========== ARM64 指令编码 ==========
 #define ARM64_MOV_W0_1  0x52800020U
